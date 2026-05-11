@@ -10,13 +10,16 @@ Brain-controlled 4WD car using a Muse 2 EEG headband. The "brain control" is rea
 4. **Pivoted again:** Just buy a Muse 2 — the EEG build was the excuse, the car is the goal
 5. **Software pivot 1:** JavaScript via Electron + muse-js (not Python)
 6. **Software pivot 2:** Drop Electron, use pure terminal Node with `@abandonware/noble` for BLE
+7. **Software pivot 3:** Drop terminal Node + noble, use Next.js + Web Bluetooth API in the browser (`muse-js`). Deployed to Vercel; run locally (`npm run dev`) when driving so `ws://car.local` isn't blocked by mixed content.
 
 ## Architecture
 ```
-[Muse 2] --BLE--> [Laptop: Node + noble] --WiFi UDP--> [ESP32 on car] --GPIO--> motors
+[Muse 2] --BLE--> [Browser on Laptop: Web Bluetooth + muse-js] --ws://car.local--> [ESP32 on car] --GPIO--> motors
 ```
 
-Laptop is a required middleman because Muse only speaks BLE and BLE needs a real host stack. **ESP-NOW direct (Muse → ESP32) is impossible** — Muse is not an ESP32. Only way to eliminate the laptop is to build your own headband (Cerelog path) — out of scope.
+The browser (running on the laptop) is the required BLE host. **ESP-NOW direct (Muse → ESP32) is impossible** — Muse is not an ESP32. Only way to eliminate the laptop is to build your own headband (Cerelog path) — out of scope.
+
+The app is deployed to Vercel but **must be run locally (`npm run dev`) when driving** — HTTPS Vercel → plain `ws://car.local` is blocked by browser mixed content policy.
 
 ## Reality checks
 - Consumer EEG cannot reliably decode "turn left" thoughts
@@ -28,9 +31,10 @@ Laptop is a required middleman because Muse only speaks BLE and BLE needs a real
 - Muse 2: 4 EEG channels (AF7, AF8, TP9, TP10) + 3-axis accel/gyro + PPG. Forehead + behind-ears only, no through-hair coverage — fine for this project.
 
 ## Software stack
-- **Node.js** (pure terminal, no Electron, no GUI)
-- **`@abandonware/noble`** — Node BLE library, talks to Muse 2 directly
-- **`dgram`** (UDP) or **`ws`** (WebSocket) — sends commands to car
+- **Next.js** (App Router, TypeScript, Tailwind) — browser dashboard, deployed to Vercel, run locally when driving
+- **Web Bluetooth API** — browser-native BLE, Chromium-only (Chrome, Edge)
+- **`muse-js`** — GATT client for Muse 2 over Web Bluetooth
+- **WebSocket client** (`ws://car.local`) — sends commands to car from the browser
 - **Arduino IDE 2.x** — flashes ESP32 with C++ firmware (uses `esptool.py` under the hood, hidden behind Upload button)
 - ESP32 board support URL: `https://espressif.github.io/arduino-esp32/package_esp32_index.json`
 - Alternative: PlatformIO in VS Code (better long-term, same toolchain underneath)
@@ -83,9 +87,9 @@ All grounds tied together. ESP32 3.3V → TB6612 VCC (logic power).
 - A=on, B=on → brake
 
 ## Build phases (revised)
-1. **Phase 1 — Terminal hello world.** Node script connects to Muse via noble, prints "blink", "jaw clench", and accelerometer values to terminal in real time. No car involved.
-2. **Phase 2 — Forward only.** ESP32 sketch: WiFi connect, UDP listener, drive forward 200ms on any packet. Node script sends a packet on every blink.
-3. **Phase 3 — Add reverse.** Jaw clench = reverse packet. Packet content tells ESP32 direction.
+1. **Phase 1 — Browser hello world.** Next.js dashboard: connect to Muse via Web Bluetooth, display live "blink", "jaw clench", and accelerometer values on screen. No car involved.
+2. **Phase 2 — Forward only.** ESP32 sketch: WiFi connect, WebSocket server, drive forward 200ms on any message. Browser sends a message on every blink.
+3. **Phase 3 — Add reverse.** Jaw clench = reverse message. Message content tells ESP32 direction.
 4. **Phase 4 — Add steering.** Stream accelerometer roll continuously, differential motor control.
 
 ## Shopping list (ordered, ~€380-430 from Amazon.de)
