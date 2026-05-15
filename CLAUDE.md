@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two codebases live here:
 
-- `laptop/` — Next.js app (the browser-based dashboard). Scaffolded, no feature code yet.
-- `car/` — ESP32 Arduino sketch. Does not exist yet.
+- `laptop/` — Next.js app (the browser-based dashboard). Phase 1 complete: Muse BLE connect, blink/jaw clench/accel display, simulate mode, WebSocket client to car.
+- `car/` — ESP32 Arduino sketch. Phase 2 complete: WiFi, mDNS (`car.local`), WebSocket server on port 81, motor control.
 
 The README is the source of truth for decisions, architecture, and the build plan; read it before suggesting changes.
 
@@ -32,7 +32,7 @@ Work follows the four phases in the README (§ Build phases). Don't skip ahead �
 
 - **ESP32 is 2.4 GHz WiFi only.** WiFi creds are hardcoded in the sketch.
 - Use **mDNS (`car.local`)** rather than hardcoded IP — router IP changes.
-- **GPIO pinout to TB6612** is fixed in README (PWMA=4, AIN1=5, AIN2=6, PWMB=7, BIN1=15, BIN2=16, STBY=17). Use these.
+- **GPIO pinout to TB6612** is fixed in README (PWMA=4, AIN1=5, AIN2=18, PWMB=19, BIN1=15, BIN2=16, STBY=17). Use these. GPIO 6 and 7 are flash pins on ESP32 — unusable.
 - Direction truth table: A=on/B=off → forward; A=off/B=on → reverse; both off → coast; both on → brake.
 - Muse 2 channels: AF7, AF8, TP9, TP10 + accel/gyro + PPG.
 - **Web Bluetooth** requires a secure context (HTTPS or localhost). Works on `localhost` in dev and on the Vercel deployment URL, but not on plain HTTP.

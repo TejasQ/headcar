@@ -72,8 +72,8 @@ All grounds tied together. ESP32 3.3V → TB6612 VCC (logic power).
 |---|---|---|
 | 4 | PWMA | Left speed (PWM) |
 | 5 | AIN1 | Left direction A |
-| 6 | AIN2 | Left direction B |
-| 7 | PWMB | Right speed (PWM) |
+| 18 | AIN2 | Left direction B |
+| 19 | PWMB | Right speed (PWM) |
 | 15 | BIN1 | Right direction A |
 | 16 | BIN2 | Right direction B |
 | 17 | STBY | Enable (HIGH = on) |
@@ -87,8 +87,8 @@ All grounds tied together. ESP32 3.3V → TB6612 VCC (logic power).
 - A=on, B=on → brake
 
 ## Build phases (revised)
-1. **Phase 1 — Browser hello world.** Next.js dashboard: connect to Muse via Web Bluetooth, display live "blink", "jaw clench", and accelerometer values on screen. No car involved.
-2. **Phase 2 — Forward only.** ESP32 sketch: WiFi connect, WebSocket server, drive forward 200ms on any message. Browser sends a message on every blink.
+1. **Phase 1 — Browser hello world.** ✓ DONE. Next.js dashboard: connect to Muse via Web Bluetooth, display live "blink", "jaw clench", and accelerometer values on screen. Simulate mode included — fires fake blink/clench/accel so the full browser→WebSocket→car pipeline can be tested before the Muse arrives. No car involved.
+2. **Phase 2 — Forward only.** ESP32 sketch: WiFi connect, WebSocket server, drive forward 200ms on any message. Browser sends a message on every blink. Sketch written and WiFi confirmed working; motor wiring + end-to-end test pending.
 3. **Phase 3 — Add reverse.** Jaw clench = reverse message. Message content tells ESP32 direction.
 4. **Phase 4 — Add steering.** Stream accelerometer roll continuously, differential motor control.
 

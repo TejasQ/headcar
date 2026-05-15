@@ -1,0 +1,79 @@
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WebSocketsServer.h>
+
+// ── Fill these in ──────────────────────────────────────────────
+const char* ssid     = "REV-17";
+const char* password = "Rev17181920!";
+// ──────────────────────────────────────────────────────────────
+
+// Motor driver pins (TB6612FNG, from README)
+#define PWMA  4
+#define AIN1  5
+#define AIN2  18   // was 6 — GPIO 6 is a flash pin on ESP32, unusable
+#define PWMB  19   // was 7 — GPIO 7 is a flash pin on ESP32, unusable
+#define BIN1  15
+#define BIN2  16
+#define STBY  17
+
+WebSocketsServer ws(81);
+
+void motorsOff() {
+  digitalWrite(STBY, LOW);
+}
+
+void driveForward(int ms) {
+  digitalWrite(STBY, HIGH);
+  // Left motor forward: AIN1=HIGH, AIN2=LOW
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  ledcWrite(PWMA, 180);
+  // Right motor forward: BIN1=HIGH, BIN2=LOW
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+  ledcWrite(PWMB, 180);
+
+  delay(ms);
+  motorsOff();
+}
+
+void onWsEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_TEXT || type == WStype_BIN) {
+    Serial.println("WS message → drive forward 200ms");
+    driveForward(200);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  ledcAttach(PWMA, 1000, 8);  // 1 kHz, 8-bit (0–255)
+  ledcAttach(PWMB, 1000, 8);
+  motorsOff();
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.print("\nIP: ");
+  Serial.println(WiFi.localIP());
+
+  if (MDNS.begin("car")) {
+    Serial.println("mDNS started → car.local");
+  }
+
+  ws.begin();
+  ws.onEvent(onWsEvent);
+  Serial.println("WebSocket server ready on port 81");
+}
+
+void loop() {
+  ws.loop();
+}
