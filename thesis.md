@@ -38,6 +38,12 @@ Also discovered the MP1584 buck converter boards have bare through-holes (no scr
 
 Muse 2 arrived today. Next session: either fix the hardware blocker or pivot to getting the Muse talking to the browser dashboard first.
 
+### 2026-05-19
+
+Muse hello world achieved. Connected the Muse 2 to the browser dashboard via Web Bluetooth in Chrome. Blink detection firing on AF7/AF8, jaw clench detecting EMG bursts across all channels, accelerometer showing live x/y/z values. Phase 1 fully confirmed with real hardware — the entire signal chain from headband to browser is working.
+
+Next: fix the TB6612 connector issue and complete the motor test to close out Phase 2.
+
 ---
 
 ## Notes for thesis chapters
