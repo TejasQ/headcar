@@ -5,12 +5,12 @@ import { MuseClient } from 'muse-js'
 
 const BLINK_THRESHOLD = 100   // μV on AF7/AF8
 const CLENCH_THRESHOLD = 150  // μV across any channel
-const CAR_WS = 'ws://car.local:81'
 
 export default function Home() {
   const [museStatus, setMuseStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle')
   const [museError, setMuseError] = useState<string | null>(null)
   const [carStatus, setCarStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected')
+  const [carUrl, setCarUrl] = useState('ws://172.20.10.2:81')
   const [blink, setBlink] = useState(false)
   const [jawClench, setJawClench] = useState(false)
   const [accel, setAccel] = useState({ x: 0, y: 0, z: 0 })
@@ -49,7 +49,7 @@ export default function Home() {
   function connectCar() {
     wsRef.current?.close()
     setCarStatus('connecting')
-    const ws = new WebSocket(CAR_WS)
+    const ws = new WebSocket(carUrl)
     wsRef.current = ws
     ws.onopen = () => { setCarStatus('connected'); addLog('car connected') }
     ws.onclose = () => { setCarStatus('disconnected'); addLog('car disconnected') }
@@ -127,13 +127,15 @@ export default function Home() {
     carStatus === 'error'       ? 'Car error — retry' :
     'Connect car'
 
+  const carConnected = carStatus === 'connected'
+
   return (
     <main className="min-h-screen bg-gray-900 text-white p-8">
       <h1 className="text-3xl font-bold mb-1">Brain Car Dashboard</h1>
       <p className="text-gray-400 mb-8 text-sm">Phase 1 — Muse sensor readings</p>
 
       {/* Controls */}
-      <div className="flex flex-wrap items-center gap-3 mb-10">
+      <div className="flex flex-wrap items-center gap-3 mb-6">
         <button
           onClick={connectMuse}
           disabled={museStatus === 'connecting' || museStatus === 'connected'}
@@ -142,13 +144,23 @@ export default function Home() {
           {museLabel}
         </button>
 
-        <button
-          onClick={connectCar}
-          disabled={carStatus === 'connecting' || carStatus === 'connected'}
-          className="bg-emerald-700 hover:bg-emerald-600 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-3 rounded-lg font-medium transition-colors"
-        >
-          {carLabel}
-        </button>
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={carUrl}
+            onChange={e => setCarUrl(e.target.value)}
+            disabled={carStatus === 'connecting' || carStatus === 'connected'}
+            className="bg-gray-800 border border-gray-600 disabled:opacity-50 text-sm px-3 py-3 rounded-lg font-mono w-52 focus:outline-none focus:border-gray-400"
+            placeholder="ws://ip:81"
+          />
+          <button
+            onClick={connectCar}
+            disabled={carStatus === 'connecting' || carStatus === 'connected'}
+            className="bg-emerald-700 hover:bg-emerald-600 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-3 rounded-lg font-medium transition-colors"
+          >
+            {carLabel}
+          </button>
+        </div>
 
         <button
           onClick={simulating ? stopSimulate : startSimulate}
@@ -160,6 +172,34 @@ export default function Home() {
         </button>
 
         {museError && <p className="text-red-400 text-sm">{museError}</p>}
+      </div>
+
+      {/* Manual controls */}
+      <div className="max-w-3xl mb-8">
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Manual control</p>
+        <div className="flex gap-3">
+          <button
+            onClick={() => sendCommand('blink')}
+            disabled={!carConnected}
+            className="bg-yellow-600 hover:bg-yellow-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-medium transition-colors"
+          >
+            Forward
+          </button>
+          <button
+            onClick={() => sendCommand('clench')}
+            disabled={!carConnected}
+            className="bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-medium transition-colors"
+          >
+            Reverse
+          </button>
+          <button
+            onClick={() => sendCommand('stop')}
+            disabled={!carConnected}
+            className="bg-gray-600 hover:bg-gray-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-medium transition-colors"
+          >
+            Stop
+          </button>
+        </div>
       </div>
 
       {/* Sensor cards */}

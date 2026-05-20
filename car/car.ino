@@ -3,8 +3,8 @@
 #include <WebSocketsServer.h>
 
 // ── Fill these in ──────────────────────────────────────────────
-const char* ssid     = "REV-17";
-const char* password = "Rev17181920!";
+const char* ssid     = "Jon iPhone 16";
+const char* password = "jon42027";
 // ──────────────────────────────────────────────────────────────
 
 // Motor driver pins (TB6612FNG, from README)
@@ -37,10 +37,30 @@ void driveForward(int ms) {
   motorsOff();
 }
 
+void driveReverse(int ms) {
+  digitalWrite(STBY, HIGH);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, HIGH);
+  ledcWrite(PWMA, 180);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, HIGH);
+  ledcWrite(PWMB, 180);
+  delay(ms);
+  motorsOff();
+}
+
 void onWsEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
-  if (type == WStype_TEXT || type == WStype_BIN) {
-    Serial.println("WS message → drive forward 200ms");
+  if (type != WStype_TEXT) return;
+  String msg = String((char*)payload);
+  if (msg == "blink") {
+    Serial.println("blink → forward 200ms");
     driveForward(200);
+  } else if (msg == "clench") {
+    Serial.println("clench → reverse 200ms");
+    driveReverse(200);
+  } else if (msg == "stop") {
+    Serial.println("stop");
+    motorsOff();
   }
 }
 

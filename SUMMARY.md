@@ -82,8 +82,8 @@ Direction truth table:
 ## Build phases
 
 1. Phase 1 — Browser hello world. DONE. Next.js dashboard with Muse BLE connect, blink/jaw clench/accel display, simulate mode, and WebSocket client to car. Live tested with real Muse 2 — blink, jaw clench, and accelerometer all confirmed working.
-2. Phase 2 — Forward only. ESP32 sketch written, WiFi confirmed working. Wiring partially done: battery power, GND, VCC, STBY, and all 6 signal wires connected. Blocked on loose female connectors not staying on TB6612 pins — needs tape fix or header pins soldered. Buck converter also needs soldering (xHain makerspace). ESP32 powered via USB in the meantime. End-to-end motor test pending.
-3. Phase 3 — Add reverse. Jaw clench = reverse message. Message content tells ESP32 direction.
+2. Phase 2 — Forward only. Wiring complete: TB6612 seated on breadboard (solved loose connector issue), all 11 connections made, one motor wired via pin-through-copper-ring hack (no solder). Buck converter still needs soldering — ESP32 powered via USB for now. WebSocket connection attempted: car.local mDNS does not resolve on Windows, switched to raw IP. Home router (REV-17) has AP isolation enabled — devices on same WiFi cannot talk to each other. Switched to iPhone hotspot (172.20.10.2). End-to-end motor test in progress.
+3. Phase 3 — Add reverse. DONE (sketch side). ESP32 now parses message payload: blink = forward 200ms, clench = reverse 200ms, stop = coast. Dashboard updated with manual Forward/Reverse/Stop buttons and configurable car URL input (no longer hardcoded).
 4. Phase 4 — Add steering. Stream accelerometer roll continuously, differential motor control.
 
 ## Shopping list (~380-430 EUR from Amazon.de)
@@ -103,6 +103,13 @@ Car body: Bare 4WD Robot Chassis Kit with TT motors (~20-30 EUR) — NOT the ful
 Tools:
 - Breadboard + mixed-gender jumper kit (M2M + M2F + F2F, ~10-12 EUR)
 - Digital multimeter (~15 EUR) — set buck to exactly 5V before connecting ESP32
+
+## Networking gotchas
+
+- car.local mDNS does not resolve reliably on Windows — use raw IP address instead
+- Home routers often have AP isolation enabled, which blocks device-to-device communication on the same WiFi — use a phone hotspot instead (no AP isolation)
+- ESP32 WiFi credentials are hardcoded in the sketch — reflash whenever switching networks
+- Laptop and ESP32 must be on the same network for WebSocket to work
 
 ## Critical gotchas
 

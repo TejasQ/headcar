@@ -44,6 +44,21 @@ Muse hello world achieved. Connected the Muse 2 to the browser dashboard via Web
 
 Next: fix the TB6612 connector issue and complete the motor test to close out Phase 2.
 
+### 2026-05-20
+
+Phase 3 sketch complete. The ESP32 now parses the WebSocket message payload rather than driving forward on any message. Protocol: `blink` = forward 200ms, `clench` = reverse 200ms, `stop` = coast. This is a meaningful step — the system now has bidirectional control from a single sensor stream.
+
+Dashboard also improved: car WebSocket URL is now editable in a text input rather than hardcoded, and manual Forward/Reverse/Stop buttons were added. This makes hardware testing much more practical — no need to trigger simulate or wear the headband just to send a test command to the car.
+
+Later: TB6612 connector issue resolved by seating the board firmly into the breadboard — it is designed to be breadboard-compatible and the pins grip properly when fully inserted. All 11 connections remade through the breadboard rows. Motor terminals had no pre-soldered wires; used a no-solder hack — pushed male jumper pins through the copper rings on the motor terminals and bent them over, held with tape. Enough for a bench test.
+
+WebSocket connection issues encountered:
+- car.local mDNS does not resolve on Windows — had to switch to raw IP address
+- Home router (REV-17) has AP isolation enabled, preventing laptop and ESP32 from communicating on the same network
+- Solution: switched to iPhone hotspot, which does not have AP isolation. ESP32 now on 172.20.10.2
+
+These are important practical notes for the thesis — consumer networking infrastructure introduces real barriers to local IoT communication that are not obvious from the hardware design alone. mDNS is unreliable on Windows and AP isolation is a common default on home routers.
+
 ---
 
 ## Notes for thesis chapters
