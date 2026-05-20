@@ -3,9 +3,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { MuseClient } from 'muse-js'
 
-const BLINK_THRESHOLD = 100   // μV on AF7/AF8
-const CLENCH_THRESHOLD = 150  // μV across any channel
-
 export default function Home() {
   const [museStatus, setMuseStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle')
   const [museError, setMuseError] = useState<string | null>(null)
@@ -16,9 +13,12 @@ export default function Home() {
   const [accel, setAccel] = useState({ x: 0, y: 0, z: 0 })
   const [simulating, setSimulating] = useState(false)
   const [log, setLog] = useState<string[]>([])
+  const [blinkThreshold, setBlinkThreshold] = useState(100)
+  const [clenchThreshold, setClenchThreshold] = useState(150)
 
   const wsRef = useRef<WebSocket | null>(null)
   const simTimers = useRef<ReturnType<typeof setInterval>[]>([])
+  const accelRef = useRef({ x: 0, y: 0, z: 0 })  // always-current accel for steering interval
 
   function addLog(msg: string) {
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -32,6 +32,11 @@ export default function Home() {
     } else {
       addLog(`⚠ ${cmd}  (car not connected)`)
     }
+  }
+
+  function updateAccel(val: { x: number; y: number; z: number }) {
+    setAccel(val)
+    accelRef.current = val
   }
 
   function triggerBlink() {
@@ -67,15 +72,15 @@ export default function Home() {
 
       client.accelerometerData.subscribe(data => {
         const s = data.samples[0]
-        setAccel({ x: s.x, y: s.y, z: s.z })
+        updateAccel({ x: s.x, y: s.y, z: s.z })
       })
 
       client.eegReadings.subscribe(reading => {
         const peak = Math.max(...reading.samples.map(Math.abs))
-        if ((reading.electrode === 1 || reading.electrode === 2) && peak > BLINK_THRESHOLD) {
+        if ((reading.electrode === 1 || reading.electrode === 2) && peak > blinkThreshold) {
           triggerBlink()
         }
-        if (peak > CLENCH_THRESHOLD) {
+        if (peak > clenchThreshold) {
           triggerClench()
         }
       })
@@ -93,7 +98,7 @@ export default function Home() {
       setInterval(() => triggerClench(), 7000),
       setInterval(() => {
         const t = (Date.now() - start) / 1000
-        setAccel({
+        updateAccel({
           x: Math.sin(t * 0.5) * 0.3,
           y: Math.cos(t * 0.3) * 0.2,
           z: 1 + Math.sin(t * 0.8) * 0.05,
@@ -109,6 +114,19 @@ export default function Home() {
     setSimulating(false)
     addLog('simulate stopped')
   }
+
+  // Stream steering to car every 100ms when connected.
+  // Uses accelRef (not state) to avoid stale closure — accelRef always has latest value.
+  // Sends silently (no log entry) to avoid flooding the command log.
+  useEffect(() => {
+    if (carStatus !== 'connected') return
+    const id = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(`steer:${accelRef.current.x.toFixed(3)}`)
+      }
+    }, 100)
+    return () => clearInterval(id)
+  }, [carStatus])
 
   useEffect(() => () => {
     simTimers.current.forEach(clearInterval)
@@ -132,7 +150,7 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-gray-900 text-white p-8">
       <h1 className="text-3xl font-bold mb-1">Brain Car Dashboard</h1>
-      <p className="text-gray-400 mb-8 text-sm">Phase 1 — Muse sensor readings</p>
+      <p className="text-gray-400 mb-8 text-sm">Phases 1–3 complete · Phase 4 steering active</p>
 
       {/* Controls */}
       <div className="flex flex-wrap items-center gap-3 mb-6">
@@ -207,23 +225,58 @@ export default function Home() {
         <div className={`p-6 rounded-xl transition-colors duration-100 ${blink ? 'bg-yellow-500' : 'bg-gray-800'}`}>
           <h2 className="text-lg font-semibold">Blink</h2>
           <p className="text-5xl font-mono mt-3 mb-4">{blink ? 'YES' : '—'}</p>
-          <p className="text-xs text-gray-400">AF7 / AF8 · {`>`}{BLINK_THRESHOLD} μV</p>
+          <p className="text-xs text-gray-400">AF7 / AF8 · {`>`}{blinkThreshold} μV</p>
         </div>
 
         <div className={`p-6 rounded-xl transition-colors duration-100 ${jawClench ? 'bg-red-500' : 'bg-gray-800'}`}>
           <h2 className="text-lg font-semibold">Jaw Clench</h2>
           <p className="text-5xl font-mono mt-3 mb-4">{jawClench ? 'YES' : '—'}</p>
-          <p className="text-xs text-gray-400">All channels · {`>`}{CLENCH_THRESHOLD} μV</p>
+          <p className="text-xs text-gray-400">All channels · {`>`}{clenchThreshold} μV</p>
         </div>
 
-        <div className="p-6 rounded-xl bg-gray-800">
+        <div className={`p-6 rounded-xl bg-gray-800 ${carConnected ? 'ring-1 ring-emerald-600' : ''}`}>
           <h2 className="text-lg font-semibold">Head Tilt</h2>
           <div className="font-mono mt-3 mb-4 space-y-1 text-sm">
             <p>X: {accel.x.toFixed(3)}</p>
             <p>Y: {accel.y.toFixed(3)}</p>
             <p>Z: {accel.z.toFixed(3)}</p>
           </div>
-          <p className="text-xs text-gray-400">Accelerometer</p>
+          <p className="text-xs text-gray-400">
+            {carConnected ? 'Streaming steer:X to car' : 'Accelerometer'}
+          </p>
+        </div>
+      </div>
+
+      {/* Threshold sliders */}
+      <div className="max-w-3xl mb-8">
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-3">Thresholds</p>
+        <div className="grid grid-cols-2 gap-6 bg-gray-800 rounded-xl p-4">
+          <div>
+            <label className="text-sm text-gray-300 mb-2 block">
+              Blink — {blinkThreshold} μV
+            </label>
+            <input
+              type="range" min={50} max={300} value={blinkThreshold}
+              onChange={e => setBlinkThreshold(Number(e.target.value))}
+              className="w-full accent-yellow-500"
+            />
+            <div className="flex justify-between text-xs text-gray-600 mt-1">
+              <span>50</span><span>300</span>
+            </div>
+          </div>
+          <div>
+            <label className="text-sm text-gray-300 mb-2 block">
+              Jaw clench — {clenchThreshold} μV
+            </label>
+            <input
+              type="range" min={100} max={400} value={clenchThreshold}
+              onChange={e => setClenchThreshold(Number(e.target.value))}
+              className="w-full accent-red-500"
+            />
+            <div className="flex justify-between text-xs text-gray-600 mt-1">
+              <span>100</span><span>400</span>
+            </div>
+          </div>
         </div>
       </div>
 

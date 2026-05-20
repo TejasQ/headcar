@@ -44,6 +44,16 @@ Muse hello world achieved. Connected the Muse 2 to the browser dashboard via Web
 
 Next: visit xHain makerspace to solder motor terminals and buck converter. All software and signal-level hardware verified working — the only remaining blocker is physical wire-to-motor contact.
 
+While waiting on the hardware blocker, completed Phase 4 software ahead of time:
+
+ESP32 sketch refactored from blocking delay() to a non-blocking state machine using millis(). This is architecturally important — the old approach froze the microcontroller during motor bursts, meaning it couldn't receive a stop or steer command while moving. The new approach checks elapsed time in every loop iteration and applies motor state continuously, allowing steering updates to take effect immediately during a drive burst.
+
+Differential steering formula: leftSpeed = 180 + (steerValue * 80), rightSpeed = 180 - (steerValue * 80), clamped to 0-255. A steerValue of +1 gives left=255, right=100 (turns right). A value of 0 gives both at 180 (straight).
+
+Dashboard now streams steer:X every 100ms to the car using the accelerometer X axis as the roll value. An accelRef (useRef) is used alongside the accel state so the streaming interval always reads the latest value without stale closure issues — a subtle but important React pattern. Steer commands are sent silently (not logged) to avoid flooding the command log.
+
+Threshold sliders added — blink (50-300 μV) and clench (100-400 μV) are now adjustable live on the dashboard without editing code. This will be important for calibration once real driving begins.
+
 ### 2026-05-20
 
 Phase 3 sketch complete. The ESP32 now parses the WebSocket message payload rather than driving forward on any message. Protocol: `blink` = forward 200ms, `clench` = reverse 200ms, `stop` = coast. This is a meaningful step — the system now has bidirectional control from a single sensor stream.
