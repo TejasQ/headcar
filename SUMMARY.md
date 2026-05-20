@@ -82,7 +82,7 @@ Direction truth table:
 ## Build phases
 
 1. Phase 1 — Browser hello world. DONE. Next.js dashboard with Muse BLE connect, blink/jaw clench/accel display, simulate mode, and WebSocket client to car. Live tested with real Muse 2 — blink, jaw clench, and accelerometer all confirmed working.
-2. Phase 2 — Forward only. Wiring complete: TB6612 seated on breadboard (solved loose connector issue), all 11 connections made, one motor wired via pin-through-copper-ring hack (no solder). Buck converter still needs soldering — ESP32 powered via USB for now. WebSocket connection attempted: car.local mDNS does not resolve on Windows, switched to raw IP. Home router (REV-17) has AP isolation enabled — devices on same WiFi cannot talk to each other. Switched to iPhone hotspot (172.20.10.2). End-to-end motor test in progress.
+2. Phase 2 — Forward only. Software fully working: ESP32 receives WebSocket commands, Serial Monitor confirms correct messages. Hardware blocked: motor terminals are bare copper rings requiring soldered wires — pin-through-ring hack does not make reliable contact. Buck converter also needs soldering. Both require a visit to xHain makerspace (Grünberger Str. 16, open from 18:00). All other wiring confirmed correct via multimeter: VM=7.4V, VCC=3.3V, STBY=3.3V, PWMA=2.3V PWM, AIN1/AIN2 correct. Phase 2 will be complete after soldering.
 3. Phase 3 — Add reverse. DONE (sketch side). ESP32 now parses message payload: blink = forward 200ms, clench = reverse 200ms, stop = coast. Dashboard updated with manual Forward/Reverse/Stop buttons and configurable car URL input (no longer hardcoded).
 4. Phase 4 — Add steering. Stream accelerometer roll continuously, differential motor control.
 

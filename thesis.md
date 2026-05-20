@@ -42,13 +42,17 @@ Muse 2 arrived today. Next session: either fix the hardware blocker or pivot to 
 
 Muse hello world achieved. Connected the Muse 2 to the browser dashboard via Web Bluetooth in Chrome. Blink detection firing on AF7/AF8, jaw clench detecting EMG bursts across all channels, accelerometer showing live x/y/z values. Phase 1 fully confirmed with real hardware — the entire signal chain from headband to browser is working.
 
-Next: fix the TB6612 connector issue and complete the motor test to close out Phase 2.
+Next: visit xHain makerspace to solder motor terminals and buck converter. All software and signal-level hardware verified working — the only remaining blocker is physical wire-to-motor contact.
 
 ### 2026-05-20
 
 Phase 3 sketch complete. The ESP32 now parses the WebSocket message payload rather than driving forward on any message. Protocol: `blink` = forward 200ms, `clench` = reverse 200ms, `stop` = coast. This is a meaningful step — the system now has bidirectional control from a single sensor stream.
 
 Dashboard also improved: car WebSocket URL is now editable in a text input rather than hardcoded, and manual Forward/Reverse/Stop buttons were added. This makes hardware testing much more practical — no need to trigger simulate or wear the headband just to send a test command to the car.
+
+Extensive multimeter diagnosis on the TB6612 confirmed all signal-level connections correct: VM=7.4V, VCC=3.3V, STBY=3.3V, PWMA=2.3V (PWM average), AIN1=3.3V, AIN2=0V. The chip is alive and receiving correct inputs. The motor does not spin because the bare terminal connection (pin pushed through copper ring, no solder) does not make reliable electrical contact. This is a hard physical constraint — soldering is required and there is no workaround.
+
+This is a useful practical lesson for the thesis: prototype hardware failures are often not in the logic or firmware but in the physical connection layer. The software stack was fully verified before the hardware was ready, which is good practice but means the first real motor test is blocked on a trip to the makerspace.
 
 Later: TB6612 connector issue resolved by seating the board firmly into the breadboard — it is designed to be breadboard-compatible and the pins grip properly when fully inserted. All 11 connections remade through the breadboard rows. Motor terminals had no pre-soldered wires; used a no-solder hack — pushed male jumper pins through the copper rings on the motor terminals and bent them over, held with tape. Enough for a bench test.
 
