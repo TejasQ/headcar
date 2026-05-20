@@ -119,7 +119,7 @@ Tools:
 - Motor wires run up from bottom plate through chassis slots to TB6612
 - All power and signal wires tied down with zip ties
 
-Buy before xHain: velcro tape or double-sided foam tape + zip ties (any supermarket).
+Buy before xHain: velcro tape or double-sided foam tape + zip ties — Rossmann is closest in Friedrichshain.
 
 ## Critical gotchas
 
