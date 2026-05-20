@@ -111,6 +111,16 @@ Tools:
 - ESP32 WiFi credentials are hardcoded in the sketch — reflash whenever switching networks
 - Laptop and ESP32 must be on the same network for WebSocket to work
 
+## Mounting plan (top plate of chassis)
+
+- 18650 battery holder — velcro or zip tie
+- Buck converter — double-sided tape or zip tie
+- ESP32 + TB6612 on breadboard — breadboard adhesive backing sticks to plate
+- Motor wires run up from bottom plate through chassis slots to TB6612
+- All power and signal wires tied down with zip ties
+
+Buy before xHain: velcro tape or double-sided foam tape + zip ties (any supermarket).
+
 ## Critical gotchas
 
 - All grounds tied together — the number one thing that bites first-timers

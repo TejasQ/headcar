@@ -54,6 +54,8 @@ Dashboard now streams steer:X every 100ms to the car using the accelerometer X a
 
 Threshold sliders added — blink (50-300 μV) and clench (100-400 μV) are now adjustable live on the dashboard without editing code. This will be important for calibration once real driving begins.
 
+Plan for tomorrow: visit xHain makerspace to solder motor terminals (8 connections across 4 motors) and buck converter (4 connections). Will also mount everything onto the chassis top plate using velcro tape and zip ties. Once complete the car runs entirely from the 18650 battery with no USB connection — ESP32 powered via buck converter at 5V, motors powered directly from battery via TB6612. The laptop communicates only over WiFi via the phone hotspot.
+
 ### 2026-05-20
 
 Phase 3 sketch complete. The ESP32 now parses the WebSocket message payload rather than driving forward on any message. Protocol: `blink` = forward 200ms, `clench` = reverse 200ms, `stop` = coast. This is a meaningful step — the system now has bidirectional control from a single sensor stream.
