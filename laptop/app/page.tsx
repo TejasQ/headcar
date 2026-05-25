@@ -25,6 +25,8 @@ export default function Home() {
   const accelOffsetRef = useRef(0)
   const blinkThresholdRef = useRef(100)
   const clenchThresholdRef = useRef(150)
+  const lastBlinkRef = useRef(0)
+  const lastClenchRef = useRef(0)
 
   // Load persisted thresholds on mount
   useEffect(() => {
@@ -61,12 +63,18 @@ export default function Home() {
   }
 
   function triggerBlink() {
+    const now = Date.now()
+    if (now - lastBlinkRef.current < 500) return
+    lastBlinkRef.current = now
     setBlink(true)
     setTimeout(() => setBlink(false), 300)
     sendCommand('blink')
   }
 
   function triggerClench() {
+    const now = Date.now()
+    if (now - lastClenchRef.current < 1000) return
+    lastClenchRef.current = now
     setJawClench(true)
     setTimeout(() => setJawClench(false), 500)
     sendCommand('clench')
