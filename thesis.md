@@ -75,6 +75,34 @@ WebSocket connection issues encountered:
 
 These are important practical notes for the thesis — consumer networking infrastructure introduces real barriers to local IoT communication that are not obvious from the hardware design alone. mDNS is unreliable on Windows and AP isolation is a common default on home routers.
 
+### 2026-05-22
+
+Hardware debugging session. Soldering complete from the xHain visit. Three separate problems diagnosed and worked through:
+
+**Problem 1 — grounds not tied.** When the Forward button was pressed, the ESP32 reset immediately. Cause: motor activation inrush current caused a voltage spike on the shared ground, browning out the ESP32. Fix: tied all grounds explicitly to the battery negative rail (ESP32 GND, TB6612 GND both sides, battery negative). This is the classic "tie all grounds together" rule that every hardware tutorial mentions — it's real.
+
+**Problem 2 — TB6612 VCC missing.** After fixing grounds, the car stayed connected but motors didn't respond. All control signals verified correct (VM=7.63V, STBY=3.3V, PWMA=2.3V PWM, AIN1/AIN2 correct) but AO1 read 0V. Root cause: the TB6612 VCC pin (logic supply, 3.3V from ESP32) was not wired. Without VCC the internal comparators have no reference and outputs are permanently dead. Fix: added wire from ESP32 3V3 to TB6612 VCC.
+
+**Problem 3 — counterfeit boards.** After fixing VCC, AO1 still read 0V. Verified the same result on a second spare board. All inputs confirmed correct, solder joints solid, breadboard halves correct. Conclusion: both TB6612 boards were counterfeit or defective — output transistors non-functional from factory. Ordered Adafruit ADA2448 (genuine Adafruit TB6612 breakout). Motors confirmed working by direct battery test (touched motor wires to 18650 holder leads — spun immediately).
+
+Thesis note: this sequence illustrates how hardware debugging is a systematic elimination process. Each fix revealed the next problem. The "counterfeit components" finding is worth documenting — cheap Chinese breakout boards from Amazon.de are not guaranteed to contain functional chips, and a defective TB6612 from a bad batch can pass all input-side diagnostics and still produce no output.
+
+### 2026-05-25
+
+Signal quality work on the Muse side while waiting for the Adafruit board to arrive.
+
+The initial detection approach (peak threshold on raw EEG samples) produced continuous false positives — every movement, eyebrow raise, or environmental noise triggered blink or clench events. Several layers of improvement implemented:
+
+**Calibration and steering:** Added a Calibrate button that snapshots the current accelerometer X value as the neutral reference. The displayed X value now shows the adjusted reading (raw minus offset), so after calibrating it reads near zero at rest. Also added a ±0.1 dead zone around center — trivial but essential for usability, since without it the car would constantly receive tiny steering corrections.
+
+**Detection algorithm redesign:** The naive threshold approach (`peak > threshold → fire`) was replaced with a three-layer system. First: rising edge detection — the detector fires once when signal crosses above threshold, then waits for it to drop below before re-arming. This converts a sustained blink artifact (which spans many EEG packets) into a single command. Second: multi-channel consensus for jaw clench — requires 3 of 4 channels to spike within a 150ms window. A real clench is a broadband EMG burst that hits all electrodes simultaneously; electrical noise and minor movement typically affect only one or two channels. Third: EMG smoothness filter for blink — within each 12-sample EEG packet, computes the RMS of adjacent-sample differences divided by the peak amplitude. Real blinks are slow EOG deflections (smooth signal, low ratio); forehead muscle activity (eyebrow raises, frowning) produces rapid high-frequency bursts (spiky signal, high ratio). Setting a threshold at ratio < 0.4 rejects most EMG artifacts while preserving genuine blinks.
+
+**Mutual exclusion:** Jaw clench and blink detection are now mutually exclusive — a clench suppresses blink detection for 500ms. This addresses cross-contamination: a jaw clench produces an EMG burst on all channels including AF7/AF8, which would otherwise also trigger the blink detector.
+
+**Research finding:** Investigated whether muse-js exposes the Muse's onboard artifact detection (which the official app uses). Confirmed that `artifactEvents` does not exist in muse-js v3.3.0 or any version — the library was always raw sensor data only. The web sources suggesting it existed were incorrect. All detection must be custom-implemented on raw `eegReadings`.
+
+**Live signal meters:** Added per-channel EEG amplitude display (TP9, AF7, AF8, TP10) with EMA smoothing (α=0.2) to make the signal visible in real time. With the meters, it's immediately apparent when a channel is noisy (e.g., poor electrode contact) vs clean signal. This is essential for threshold tuning — without it, thresholds were being set blind.
+
 ---
 
 ## Notes for thesis chapters

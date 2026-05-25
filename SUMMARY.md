@@ -84,7 +84,26 @@ Direction truth table:
 1. Phase 1 — Browser hello world. DONE. Next.js dashboard with Muse BLE connect, blink/jaw clench/accel display, simulate mode, and WebSocket client to car. Live tested with real Muse 2 — blink, jaw clench, and accelerometer all confirmed working.
 2. Phase 2 — Forward only. Software fully working: ESP32 receives WebSocket commands, Serial Monitor confirms correct messages. Soldering done at xHain. Post-solder debug session (2026-05-22): (1) grounds not tied — ESP32 reset on motor activation, fixed by tying all grounds to negative rail; (2) VCC missing — TB6612 logic power (3.3V from ESP32 3V3 pin) was not wired to TB6612 VCC, causing outputs to be dead; (3) after fixing VCC, AO1/AO2 still read 0V on both the original and a spare TB6612 board despite all signals verified correct (VM=7.63V, VCC=3.3V, STBY=3.3V, PWMA=3.3V, AIN1=3.3V, AIN2=0V, BIN1=3.3V, BIN2=0V, breadboard halves correct, solder joints solid) — both boards confirmed counterfeit/defective batch. Motors confirmed working via direct battery test. Left motor wires paired to AO1/AO2, right motor wires paired to BO1/BO2 (parallel per side). Ordered Adafruit ADA2448 TB6612FNG breakout (genuine) — pending arrival and retest.
 3. Phase 3 — Add reverse. DONE (sketch side). ESP32 now parses message payload: blink = forward 200ms, clench = reverse 200ms, stop = coast. Dashboard updated with manual Forward/Reverse/Stop buttons and configurable car URL input (no longer hardcoded).
-4. Phase 4 — Add steering. DONE (software). ESP32 sketch refactored to non-blocking state machine (millis() instead of delay()). Accepts steer:X messages (-1.0 to +1.0) and applies differential PWM: left/right motor speeds shift based on roll value. Dashboard streams steer:X every 100ms when car is connected, using accelRef to avoid stale closure. Threshold sliders added for blink and clench. Pending: physical motor test after TB6612 replacement.
+4. Phase 4 — Add steering. DONE (software). ESP32 sketch refactored to non-blocking state machine (millis() instead of delay()). Accepts steer:X messages (-1.0 to +1.0) and applies differential PWM: left/right motor speeds shift based on roll value. Dashboard streams steer:X every 100ms when car is connected. Pending: physical motor test after TB6612 replacement.
+
+## Dashboard signal quality work (2026-05-25)
+
+Significant improvements to the browser dashboard to make Muse detection usable in practice:
+
+**UX improvements:**
+- Head tilt calibration button — snapshots accel.x as steering zero reference; display now shows adjusted value (x − offset) so calibration is visually confirmed
+- Steering dead zone ±0.1 — prevents constant micro-corrections at neutral head position
+- Threshold persistence — blink/clench thresholds saved to localStorage and restored on reload
+- Live EEG signal meters — 4 vertical bars (TP9, AF7, AF8, TP10) showing per-channel peak amplitude at ~20Hz with EMA smoothing (α=0.2). Threshold reference lines overlaid. Makes it possible to see signal vs noise and set thresholds visually.
+
+**Detection algorithm improvements:**
+- Cooldown: blink suppressed 500ms after last fire, clench suppressed 1000ms — prevents single artifact from flooding the car with commands
+- Rising edge detection for blink — fires once when signal crosses above threshold, re-arms only after dropping below. One blink = one command regardless of how long signal stays elevated.
+- Multi-channel consensus for clench — requires 3+ of 4 channels to spike above threshold within 150ms. A real jaw clench hits all channels simultaneously; isolated single-channel noise cannot trigger it.
+- EMG smoothness filter for blink — rejects forehead/eyebrow movement (high-frequency EMG) by computing hfRms/peak ratio within each 12-sample packet. Blinks are slow EOG deflections (ratio < 0.4); forehead muscle bursts are spiky (ratio ≥ 0.4). Prevents eyebrow raises from triggering forward command.
+- Mutual exclusion — blink detection suppressed 500ms after any jaw clench fires, preventing clench EMG from simultaneously triggering the blink detector.
+
+**Research finding:** muse-js v3.3.0 has no onboard artifact detection (`artifactEvents` does not exist in any version of this library — confirmed against source). All detection is custom-implemented on raw `eegReadings`.
 
 ## Shopping list (~380-430 EUR from Amazon.de)
 

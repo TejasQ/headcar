@@ -29,6 +29,11 @@ export default function Home() {
   const lastBlinkRef = useRef(0)
   const lastClenchRef = useRef(0)
   const eegPeakTimestamps = useRef([0, 0, 0, 0])
+  const eegSmoothed = useRef([0, 0, 0, 0])
+  // Rising edge detection: armed = ready to fire on next threshold crossing
+  const blinkArmed = useRef(true)
+  // Per-channel timestamp of last spike above clench threshold (for multi-channel consensus)
+  const clenchLastSpike = useRef([0, 0, 0, 0])
 
   // Load persisted thresholds on mount
   useEffect(() => {
@@ -108,20 +113,45 @@ export default function Home() {
 
       client.eegReadings.subscribe(reading => {
         const peak = Math.max(...reading.samples.map(Math.abs))
-
-        // Throttle per-channel state updates to ~20Hz to avoid flooding React
-        const now = Date.now()
         const e = reading.electrode
-        if (e >= 0 && e <= 3 && now - eegPeakTimestamps.current[e] > 50) {
-          eegPeakTimestamps.current[e] = now
-          setEegPeaks(prev => { const next = [...prev]; next[e] = peak; return next })
+        const now = Date.now()
+
+        // EMA smoothing for display
+        if (e >= 0 && e <= 3) {
+          eegSmoothed.current[e] = 0.8 * eegSmoothed.current[e] + 0.2 * peak
+          if (now - eegPeakTimestamps.current[e] > 50) {
+            eegPeakTimestamps.current[e] = now
+            const val = eegSmoothed.current[e]
+            setEegPeaks(prev => { const next = [...prev]; next[e] = val; return next })
+          }
         }
 
-        if ((reading.electrode === 1 || reading.electrode === 2) && peak > blinkThresholdRef.current) {
-          triggerBlink()
+        // Blink: rising edge on AF7 (1) or AF8 (2) only.
+        // Reject EMG/forehead artifacts by checking signal smoothness:
+        // blinks are slow EOG deflections (low HF content); forehead/eyebrow movement
+        // is rapid EMG (high HF content). hfRms/peak > 0.4 means spiky → not a blink.
+        // Also suppressed for 500ms after a jaw clench fires (mutual exclusion).
+        if (e === 1 || e === 2) {
+          const s = reading.samples
+          const diffs = s.slice(1).map((v, i) => v - s[i])
+          const hfRms = Math.sqrt(diffs.reduce((sum, d) => sum + d * d, 0) / diffs.length)
+          const isSmooth = peak === 0 || hfRms / peak < 0.4
+          const clenchSuppressed = now - lastClenchRef.current < 500
+
+          if (peak > blinkThresholdRef.current && blinkArmed.current && isSmooth && !clenchSuppressed) {
+            blinkArmed.current = false
+            triggerBlink()
+          } else if (peak <= blinkThresholdRef.current) {
+            blinkArmed.current = true
+          }
         }
-        if (peak > clenchThresholdRef.current) {
-          triggerClench()
+
+        // Clench: require 3+ channels to have spiked above threshold within 150ms.
+        // Real jaw clenches hit all channels simultaneously; noise is isolated.
+        if (e >= 0 && e <= 3 && peak > clenchThresholdRef.current) {
+          clenchLastSpike.current[e] = now
+          const active = clenchLastSpike.current.filter(t => now - t < 150).length
+          if (active >= 3) triggerClench()
         }
       })
     } catch (e) {
@@ -266,24 +296,24 @@ export default function Home() {
         <div className={`p-6 rounded-xl transition-colors duration-100 ${blink ? 'bg-yellow-500' : 'bg-gray-800'}`}>
           <h2 className="text-lg font-semibold">Blink</h2>
           <p className="text-5xl font-mono mt-3 mb-4">{blink ? 'YES' : '—'}</p>
-          <p className="text-xs text-gray-400">AF7 / AF8 · {`>`}{blinkThreshold} μV</p>
+          <p className="text-xs text-gray-400">AF7 / AF8 · rising edge</p>
         </div>
 
         <div className={`p-6 rounded-xl transition-colors duration-100 ${jawClench ? 'bg-red-500' : 'bg-gray-800'}`}>
           <h2 className="text-lg font-semibold">Jaw Clench</h2>
           <p className="text-5xl font-mono mt-3 mb-4">{jawClench ? 'YES' : '—'}</p>
-          <p className="text-xs text-gray-400">All channels · {`>`}{clenchThreshold} μV</p>
+          <p className="text-xs text-gray-400">3+ channels within 150ms</p>
         </div>
 
         <div className={`p-6 rounded-xl bg-gray-800 ${carConnected ? 'ring-1 ring-emerald-600' : ''}`}>
           <h2 className="text-lg font-semibold">Head Tilt</h2>
           <div className="font-mono mt-3 mb-2 space-y-1 text-sm">
-            <p>X: {accel.x.toFixed(3)}</p>
+            <p>X: {(accel.x - accelOffset).toFixed(3)}</p>
             <p>Y: {accel.y.toFixed(3)}</p>
             <p>Z: {accel.z.toFixed(3)}</p>
           </div>
           <p className="text-xs text-gray-500 mb-3">
-            offset {accelOffset.toFixed(3)} · dead zone ±{DEAD_ZONE}
+            dead zone ±{DEAD_ZONE}
           </p>
           <button
             onClick={calibrate}
