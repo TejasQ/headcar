@@ -18,6 +18,7 @@ export default function Home() {
   const [blinkThreshold, setBlinkThreshold] = useState(100)
   const [clenchThreshold, setClenchThreshold] = useState(150)
   const [accelOffset, setAccelOffset] = useState(0)
+  const [eegPeaks, setEegPeaks] = useState([0, 0, 0, 0])
 
   const wsRef = useRef<WebSocket | null>(null)
   const simTimers = useRef<ReturnType<typeof setInterval>[]>([])
@@ -27,6 +28,7 @@ export default function Home() {
   const clenchThresholdRef = useRef(150)
   const lastBlinkRef = useRef(0)
   const lastClenchRef = useRef(0)
+  const eegPeakTimestamps = useRef([0, 0, 0, 0])
 
   // Load persisted thresholds on mount
   useEffect(() => {
@@ -106,6 +108,15 @@ export default function Home() {
 
       client.eegReadings.subscribe(reading => {
         const peak = Math.max(...reading.samples.map(Math.abs))
+
+        // Throttle per-channel state updates to ~20Hz to avoid flooding React
+        const now = Date.now()
+        const e = reading.electrode
+        if (e >= 0 && e <= 3 && now - eegPeakTimestamps.current[e] > 50) {
+          eegPeakTimestamps.current[e] = now
+          setEegPeaks(prev => { const next = [...prev]; next[e] = peak; return next })
+        }
+
         if ((reading.electrode === 1 || reading.electrode === 2) && peak > blinkThresholdRef.current) {
           triggerBlink()
         }
@@ -323,6 +334,55 @@ export default function Home() {
             <div className="flex justify-between text-xs text-gray-600 mt-1">
               <span>100</span><span>400</span>
             </div>
+          </div>
+        </div>
+      </div>
+
+      {/* EEG signal meters */}
+      <div className="max-w-3xl mb-8">
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-3">EEG signal · μV (max 500)</p>
+        <div className="bg-gray-800 rounded-xl p-4">
+          <div className="flex gap-4 items-end justify-around">
+            {(['TP9', 'AF7', 'AF8', 'TP10'] as const).map((label, i) => {
+              const MAX = 500
+              const peak = eegPeaks[i]
+              const fillPct = Math.min(peak / MAX * 100, 100)
+              const blinkPct = Math.min(blinkThreshold / MAX * 100, 100)
+              const clenchPct = Math.min(clenchThreshold / MAX * 100, 100)
+              const isBlinkCh = i === 1 || i === 2
+              const aboveBlink = isBlinkCh && peak > blinkThreshold
+              const aboveClench = peak > clenchThreshold
+              const barColor = aboveClench ? 'bg-red-500' : aboveBlink ? 'bg-yellow-400' : 'bg-blue-500'
+              return (
+                <div key={label} className="flex flex-col items-center gap-2 flex-1">
+                  <span className="text-xs font-mono text-gray-400">{Math.round(peak)}</span>
+                  <div className="relative w-full h-36 bg-gray-700 rounded overflow-hidden">
+                    {/* bar fill */}
+                    <div
+                      className={`absolute bottom-0 w-full transition-all duration-75 ${barColor}`}
+                      style={{ height: `${fillPct}%` }}
+                    />
+                    {/* clench threshold line */}
+                    <div
+                      className="absolute w-full border-t border-red-400 border-dashed"
+                      style={{ bottom: `${clenchPct}%` }}
+                    />
+                    {/* blink threshold line — only on AF7/AF8 */}
+                    {isBlinkCh && (
+                      <div
+                        className="absolute w-full border-t border-yellow-400 border-dashed"
+                        style={{ bottom: `${blinkPct}%` }}
+                      />
+                    )}
+                  </div>
+                  <span className="text-xs text-gray-400">{label}</span>
+                </div>
+              )
+            })}
+          </div>
+          <div className="flex gap-4 mt-3 text-xs text-gray-500">
+            <span><span className="text-yellow-400">—</span> blink threshold (AF7/AF8)</span>
+            <span><span className="text-red-400">—</span> clench threshold (all)</span>
           </div>
         </div>
       </div>
