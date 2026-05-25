@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { MuseClient } from 'muse-js'
 
+const DEAD_ZONE = 0.1
+
 export default function Home() {
   const [museStatus, setMuseStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle')
   const [museError, setMuseError] = useState<string | null>(null)
@@ -15,10 +17,22 @@ export default function Home() {
   const [log, setLog] = useState<string[]>([])
   const [blinkThreshold, setBlinkThreshold] = useState(100)
   const [clenchThreshold, setClenchThreshold] = useState(150)
+  const [accelOffset, setAccelOffset] = useState(0)
 
   const wsRef = useRef<WebSocket | null>(null)
   const simTimers = useRef<ReturnType<typeof setInterval>[]>([])
-  const accelRef = useRef({ x: 0, y: 0, z: 0 })  // always-current accel for steering interval
+  const accelRef = useRef({ x: 0, y: 0, z: 0 })
+  const accelOffsetRef = useRef(0)
+  const blinkThresholdRef = useRef(100)
+  const clenchThresholdRef = useRef(150)
+
+  // Load persisted thresholds on mount
+  useEffect(() => {
+    const b = Number(localStorage.getItem('blinkThreshold'))
+    const c = Number(localStorage.getItem('clenchThreshold'))
+    if (b) { setBlinkThreshold(b); blinkThresholdRef.current = b }
+    if (c) { setClenchThreshold(c); clenchThresholdRef.current = c }
+  }, [])
 
   function addLog(msg: string) {
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -37,6 +51,13 @@ export default function Home() {
   function updateAccel(val: { x: number; y: number; z: number }) {
     setAccel(val)
     accelRef.current = val
+  }
+
+  function calibrate() {
+    const offset = accelRef.current.x
+    setAccelOffset(offset)
+    accelOffsetRef.current = offset
+    addLog(`calibrated — offset ${offset.toFixed(3)}`)
   }
 
   function triggerBlink() {
@@ -77,10 +98,10 @@ export default function Home() {
 
       client.eegReadings.subscribe(reading => {
         const peak = Math.max(...reading.samples.map(Math.abs))
-        if ((reading.electrode === 1 || reading.electrode === 2) && peak > blinkThreshold) {
+        if ((reading.electrode === 1 || reading.electrode === 2) && peak > blinkThresholdRef.current) {
           triggerBlink()
         }
-        if (peak > clenchThreshold) {
+        if (peak > clenchThresholdRef.current) {
           triggerClench()
         }
       })
@@ -116,13 +137,14 @@ export default function Home() {
   }
 
   // Stream steering to car every 100ms when connected.
-  // Uses accelRef (not state) to avoid stale closure — accelRef always has latest value.
-  // Sends silently (no log entry) to avoid flooding the command log.
+  // Subtracts calibration offset and applies dead zone before sending.
   useEffect(() => {
     if (carStatus !== 'connected') return
     const id = setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(`steer:${accelRef.current.x.toFixed(3)}`)
+        const raw = accelRef.current.x - accelOffsetRef.current
+        const steer = Math.abs(raw) < DEAD_ZONE ? 0 : raw
+        wsRef.current.send(`steer:${steer.toFixed(3)}`)
       }
     }, 100)
     return () => clearInterval(id)
@@ -150,7 +172,7 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-gray-900 text-white p-8">
       <h1 className="text-3xl font-bold mb-1">Brain Car Dashboard</h1>
-      <p className="text-gray-400 mb-8 text-sm">Phases 1–3 complete · Phase 4 steering active</p>
+      <p className="text-gray-400 mb-8 text-sm">Phases 1–4 complete · Adafruit TB6612 pending</p>
 
       {/* Controls */}
       <div className="flex flex-wrap items-center gap-3 mb-6">
@@ -236,14 +258,21 @@ export default function Home() {
 
         <div className={`p-6 rounded-xl bg-gray-800 ${carConnected ? 'ring-1 ring-emerald-600' : ''}`}>
           <h2 className="text-lg font-semibold">Head Tilt</h2>
-          <div className="font-mono mt-3 mb-4 space-y-1 text-sm">
+          <div className="font-mono mt-3 mb-2 space-y-1 text-sm">
             <p>X: {accel.x.toFixed(3)}</p>
             <p>Y: {accel.y.toFixed(3)}</p>
             <p>Z: {accel.z.toFixed(3)}</p>
           </div>
-          <p className="text-xs text-gray-400">
-            {carConnected ? 'Streaming steer:X to car' : 'Accelerometer'}
+          <p className="text-xs text-gray-500 mb-3">
+            offset {accelOffset.toFixed(3)} · dead zone ±{DEAD_ZONE}
           </p>
+          <button
+            onClick={calibrate}
+            disabled={museStatus !== 'connected' && !simulating}
+            className="text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded font-medium transition-colors"
+          >
+            Calibrate
+          </button>
         </div>
       </div>
 
@@ -257,7 +286,12 @@ export default function Home() {
             </label>
             <input
               type="range" min={50} max={300} value={blinkThreshold}
-              onChange={e => setBlinkThreshold(Number(e.target.value))}
+              onChange={e => {
+                const v = Number(e.target.value)
+                setBlinkThreshold(v)
+                blinkThresholdRef.current = v
+                localStorage.setItem('blinkThreshold', String(v))
+              }}
               className="w-full accent-yellow-500"
             />
             <div className="flex justify-between text-xs text-gray-600 mt-1">
@@ -270,7 +304,12 @@ export default function Home() {
             </label>
             <input
               type="range" min={100} max={400} value={clenchThreshold}
-              onChange={e => setClenchThreshold(Number(e.target.value))}
+              onChange={e => {
+                const v = Number(e.target.value)
+                setClenchThreshold(v)
+                clenchThresholdRef.current = v
+                localStorage.setItem('clenchThreshold', String(v))
+              }}
               className="w-full accent-red-500"
             />
             <div className="flex justify-between text-xs text-gray-600 mt-1">
