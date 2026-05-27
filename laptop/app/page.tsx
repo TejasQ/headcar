@@ -2,59 +2,473 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { MuseClient } from 'muse-js'
+import { GestureDetector, ContactQuality, percentile } from './detector'
+import {
+  Recording, RecordingEegPacket, RecordingAccel, RecordingEvent, RecordingSegment,
+  SegmentLabel, downloadRecording,
+} from './recorder'
+import { replayRecording, ReplayResult } from './replayer'
 
 const DEAD_ZONE = 0.1
+
+// Detection rule constants.
+const CLENCH_MIN_ZCR = 0.20         // both gestures are EMG — high ZCR required
+const FORWARD_HOLD_MS = 200         // grace period after rule stops being satisfied
+const REVERSE_PULSE_MS = 800        // reverse drive duration per eyebrow trigger
+const REVERSE_COOLDOWN_MS = 1500    // prevent chained reverse pulses
+
+// AF/TP RATIO DISCRIMINATOR.
+// Clench: masseter ≈ frontalis in size → AF and TP comparable → ratio ≈ 1.
+// Eyebrow: frontalis ≫ auricularis (the small ear muscle that often co-fires
+// with the eyebrow raise on some users) → AF dominates TP → ratio > ~1.6.
+// Replaces the previous strict TP ceiling, which broke when ear muscles
+// cross-fired during eyebrow raises.
+const CLENCH_MAX_AFTP_RATIO   = 1.6
+const EYEBROW_MIN_AFTP_RATIO  = 1.6
+
+// Guided-test protocol. Scripted sequence of messages and segments with auto
+// timing — the dashboard walks the user through "do light clenches now",
+// "rest", etc., so a recording session has consistent structure across runs.
+type ProtocolStep =
+  | { type: 'message'; text: string; durationMs: number }
+  | { type: 'segment'; label: 'clench' | 'eyebrow' | 'tilt' | 'rest';
+      note?: string; instruction: string; durationMs: number }
+
+const INTENSITY_PROTOCOL: ProtocolStep[] = [
+  { type: 'message', text: 'Get ready — sit comfortably, hands relaxed. Starting in a few seconds…', durationMs: 5000 },
+  { type: 'segment', label: 'rest', note: 'baseline', instruction: 'Sit still — establishing baseline', durationMs: 10000 },
+  { type: 'message', text: 'Next: 5 LIGHT clenches. Hold each ~1.5 s, rest ~2.5 s between.', durationMs: 5000 },
+  { type: 'segment', label: 'clench', note: 'light', instruction: 'LIGHT clenches × 5 — gentle effort', durationMs: 20000 },
+  { type: 'segment', label: 'rest', note: 'between', instruction: 'Rest', durationMs: 7000 },
+  { type: 'message', text: 'Next: 5 MEDIUM clenches.', durationMs: 5000 },
+  { type: 'segment', label: 'clench', note: 'medium', instruction: 'MEDIUM clenches × 5 — moderate effort', durationMs: 20000 },
+  { type: 'segment', label: 'rest', note: 'between', instruction: 'Rest', durationMs: 7000 },
+  { type: 'message', text: 'Next: 5 HARD clenches.', durationMs: 5000 },
+  { type: 'segment', label: 'clench', note: 'hard', instruction: 'HARD clenches × 5 — full effort', durationMs: 20000 },
+  { type: 'segment', label: 'rest', note: 'final', instruction: 'Final rest', durationMs: 5000 },
+  { type: 'message', text: 'Done. Click Save .json to download the recording.', durationMs: 3000 },
+]
+
+// Anti-jitter (see ReactEMG, PMC6679304 — EMG real-time gesture lit).
+//   EMA: smooths the feature signal before rules run; ~50 ms added latency,
+//        much cleaner input.
+//   DEBOUNCE: forward must be satisfied for N consecutive evaluation ticks
+//        (rule eval is throttled to 20 Hz) before going active — prevents a
+//        single noisy tick from firing a forward burst.
+const EMA_ALPHA = 0.3
+const FORWARD_DEBOUNCE_TICKS = 3    // 3 × 50 ms = 150 ms sustained signal required
+
+// Speed mapping. Forward intensity is afMean / afThr_fwd, where 1.0 = at threshold,
+// ~3.0 = saturation. We map [1.0, 3.0] → [MIN_FWD, MAX_FWD] for the drive value.
+const MIN_FORWARD = 0.30  // minimum drive when barely clenching (overcome motor stiction)
+const MAX_FORWARD = 1.00
+const INTENSITY_SATURATION = 3.0   // afMean / afThr at which we hit MAX_FORWARD
+const REVERSE_SPEED = 0.7
+
+// Calibration window.
+const CALIBRATION_MS = 5000
+const CALIBRATION_PERCENTILE = 0.90
+
+// Default sensitivities are gesture-specific now (forward and reverse have
+// very different signal scales on this hardware — see thesis 2026-05-27 entry).
+const DEFAULT_FORWARD_SENSITIVITY = 2
+const DEFAULT_REVERSE_SENSITIVITY = 4
+const SENSITIVITY_MIN = 1.5
+const SENSITIVITY_MAX = 8
+
+type Baseline = { afHigh: number; tpHigh: number }
 
 export default function Home() {
   const [museStatus, setMuseStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle')
   const [museError, setMuseError] = useState<string | null>(null)
   const [carStatus, setCarStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected')
   const [carUrl, setCarUrl] = useState('ws://172.20.10.2:81')
-  const [blink, setBlink] = useState(false)
-  const [jawClench, setJawClench] = useState(false)
+  const [forwardActive, setForwardActive] = useState(false)
+  const [forwardSpeed, setForwardSpeed] = useState(0)
+  const [reverseActive, setReverseActive] = useState(false)
   const [accel, setAccel] = useState({ x: 0, y: 0, z: 0 })
   const [simulating, setSimulating] = useState(false)
   const [log, setLog] = useState<string[]>([])
-  const [blinkThreshold, setBlinkThreshold] = useState(100)
-  const [clenchThreshold, setClenchThreshold] = useState(150)
   const [accelOffset, setAccelOffset] = useState(0)
-  const [eegPeaks, setEegPeaks] = useState([0, 0, 0, 0])
+
+  const [forwardSensitivity, setForwardSensitivity] = useState(() => {
+    if (typeof window === 'undefined') return DEFAULT_FORWARD_SENSITIVITY
+    const v = Number(localStorage.getItem('forwardSensitivity.v5'))
+    return v || DEFAULT_FORWARD_SENSITIVITY
+  })
+  const [reverseSensitivity, setReverseSensitivity] = useState(() => {
+    if (typeof window === 'undefined') return DEFAULT_REVERSE_SENSITIVITY
+    const v = Number(localStorage.getItem('reverseSensitivity.v5'))
+    return v || DEFAULT_REVERSE_SENSITIVITY
+  })
+
+  const [baseline, setBaseline] = useState<Baseline | null>(null)
+  const [calibrating, setCalibrating] = useState(false)
+  const [calibrationLeft, setCalibrationLeft] = useState(0)
+
+  const [meters, setMeters] = useState([
+    { lowRms: 0, highRms: 0, zcr: 0, rawRms: 0 },
+    { lowRms: 0, highRms: 0, zcr: 0, rawRms: 0 },
+    { lowRms: 0, highRms: 0, zcr: 0, rawRms: 0 },
+    { lowRms: 0, highRms: 0, zcr: 0, rawRms: 0 },
+  ])
+  // Live EMA-smoothed group means, surfaced from refs so Forward/Reverse cards
+  // can show a "live preview" bar even before a trigger fires.
+  const [liveSignal, setLiveSignal] = useState({ afEma: 0, tpEma: 0 })
+
+  // Replay state. Loaded file + most recent replay result.
+  const [replayResult, setReplayResult] = useState<ReplayResult | null>(null)
+  const [replayFilename, setReplayFilename] = useState<string | null>(null)
+  const [loadedRecording, setLoadedRecording] = useState<Recording | null>(null)
+  const [contacts, setContacts] = useState<ContactQuality[]>(['bad', 'bad', 'bad', 'bad'])
 
   const wsRef = useRef<WebSocket | null>(null)
   const simTimers = useRef<ReturnType<typeof setInterval>[]>([])
   const accelRef = useRef({ x: 0, y: 0, z: 0 })
   const accelOffsetRef = useRef(0)
-  const blinkThresholdRef = useRef(100)
-  const clenchThresholdRef = useRef(150)
-  const lastBlinkRef = useRef(0)
-  const lastClenchRef = useRef(0)
-  const eegPeakTimestamps = useRef([0, 0, 0, 0])
-  const eegSmoothed = useRef([0, 0, 0, 0])
-  // Rising edge detection: armed = ready to fire on next threshold crossing
-  const blinkArmed = useRef(true)
-  // Per-channel timestamp of last spike above clench threshold (for multi-channel consensus)
-  const clenchLastSpike = useRef([0, 0, 0, 0])
 
-  // Load persisted thresholds on mount
+  // Detection state — derived from calibration baseline × sensitivity.
+  // AF forward threshold removed — see thesis 2026-05-27: AF doesn't track
+  // masseter EMG on this hardware, forward rule is TP-primary.
+  const tpThrFwdRef = useRef(Infinity)
+  const afThrRevRef = useRef(Infinity)
+
+  // EMA-smoothed feature values, updated each meter tick.
+  const afSmoothedRef = useRef(0)
+  const tpSmoothedRef = useRef(0)
+
+  // Consecutive-tick counter for the forward debounce. Counts ticks where the
+  // forward rule conditions hold; resets to 0 the moment a tick fails. Forward
+  // goes active when this hits FORWARD_DEBOUNCE_TICKS.
+  const forwardConsecutiveRef = useRef(0)
+
+  // Session recorder. While `recordingRef.current` is true, EEG packets, accel
+  // samples, detector events, and drive commands are appended to ref-buffers.
+  // Within a recording, the user explicitly opens and closes labeled segments
+  // (clench / eyebrow / tilt / rest) so each gesture attempt has a ground-truth
+  // time-range. Saved as JSON on demand. See `recorder.ts` for the format.
+  const [recording, setRecording] = useState(false)
+  const [recordingTickStats, setRecordingTickStats] = useState({ eeg: 0, accel: 0, events: 0, seconds: 0 })
+  const [hasUnsavedRecording, setHasUnsavedRecording] = useState(false)
+  const [segments, setSegments] = useState<RecordingSegment[]>([])
+  type ActiveSegment = {
+    label: SegmentLabel; note?: string; startTs: number; eegStart: number;
+    fwdStart: number; revStart: number;
+  }
+  const [activeSegment, setActiveSegment] = useState<ActiveSegment | null>(null)
+  // Mirror of activeSegment used by setTimeout callbacks. React state is async,
+  // so a callback scheduled inside beginSegmentInternal would see a stale
+  // activeSegment value when it later tries to end the segment.
+  const activeSegmentRef = useRef<ActiveSegment | null>(null)
+
+  // Guided-protocol runner state.
+  const [protocolRunning, setProtocolRunning] = useState(false)
+  const [protocolStepIdx, setProtocolStepIdx] = useState(0)
+  const [protocolStepLeft, setProtocolStepLeft] = useState(0)
+  const protocolTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const protocolStepEndsAtRef = useRef(0)
+  const [lastSegmentSummary, setLastSegmentSummary] = useState<string | null>(null)
+
+  const recordingRef = useRef(false)
+  const eegBufRef = useRef<RecordingEegPacket[]>([])
+  const accelBufRef = useRef<RecordingAccel[]>([])
+  const eventBufRef = useRef<RecordingEvent[]>([])
+  const recordingStartRef = useRef(0)
+  // Forward state-edge tracker so we can emit forward_trigger / forward_end events.
+  const forwardWasActiveRef = useRef(false)
+  // Mirrors of trigger counts used to compute per-segment summary stats.
+  const forwardTriggerCountRef = useRef(0)
+  const reverseTriggerCountRef = useRef(0)
+
+  // Gesture state used by the drive streamer.
+  const forwardActiveUntilRef = useRef(0)
+  const forwardSpeedRef = useRef(0)
+  const reverseUntilRef = useRef(0)
+  const lastReverseRef = useRef(0)
+  const drivingFlagRef = useRef(false)
+
+  const detectorRef = useRef(new GestureDetector())
+  const meterLastUpdate = useRef(0)
+
+  const calibrationAfHigh = useRef<number[]>([])
+  const calibrationTpHigh = useRef<number[]>([])
+  const calibratingRef = useRef(false)
+  const calibrationCountdown = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Derive thresholds whenever baseline or sensitivities change.
   useEffect(() => {
-    const b = Number(localStorage.getItem('blinkThreshold'))
-    const c = Number(localStorage.getItem('clenchThreshold'))
-    if (b) { setBlinkThreshold(b); blinkThresholdRef.current = b }
-    if (c) { setClenchThreshold(c); clenchThresholdRef.current = c }
-  }, [])
+    if (!baseline) {
+      tpThrFwdRef.current = Infinity
+      afThrRevRef.current = Infinity
+      return
+    }
+    tpThrFwdRef.current = baseline.tpHigh * forwardSensitivity
+    afThrRevRef.current = baseline.afHigh * reverseSensitivity
+  }, [baseline, forwardSensitivity, reverseSensitivity])
 
   function addLog(msg: string) {
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
     setLog(prev => [`${time}  ${msg}`, ...prev].slice(0, 10))
   }
 
-  function sendCommand(cmd: string) {
+  function recordEvent(type: string, data?: Record<string, number | string | boolean>) {
+    if (!recordingRef.current) return
+    eventBufRef.current.push({ ts: Date.now(), type, data })
+  }
+
+  // Confirm before discarding an unsaved recording. Returns true if the caller
+  // should proceed (user agreed to discard, or saved first), false to abort.
+  function confirmDiscardUnsaved(): boolean {
+    if (!hasUnsavedRecording) return true
+    const choice = window.confirm(
+      'You have an unsaved recording from your previous session.\n\n' +
+      'Click OK to discard it and start fresh.\n' +
+      'Click Cancel to keep it (save it first using the Save .json button).'
+    )
+    if (choice) setHasUnsavedRecording(false)
+    return choice
+  }
+
+  function startRecording() {
+    if (hasUnsavedRecording && !confirmDiscardUnsaved()) return
+    eegBufRef.current = []
+    accelBufRef.current = []
+    eventBufRef.current = []
+    forwardTriggerCountRef.current = 0
+    reverseTriggerCountRef.current = 0
+    recordingStartRef.current = Date.now()
+    setSegments([])
+    activeSegmentRef.current = null
+    setActiveSegment(null)
+    setLastSegmentSummary(null)
+    setRecordingTickStats({ eeg: 0, accel: 0, events: 0, seconds: 0 })
+    setHasUnsavedRecording(false)
+    setRecording(true)
+    recordingRef.current = true
+    addLog('● recording started')
+    if (baseline) {
+      recordEvent('session_config', {
+        baselineAfHigh: baseline.afHigh,
+        baselineTpHigh: baseline.tpHigh,
+        forwardSensitivity,
+        reverseSensitivity,
+      })
+    }
+  }
+
+  function endSegmentInternal(now: number): RecordingSegment | null {
+    const cur = activeSegmentRef.current
+    if (!cur) return null
+    const seg: RecordingSegment = {
+      label: cur.label,
+      note: cur.note,
+      startTs: cur.startTs,
+      endTs: now,
+      durationMs: now - cur.startTs,
+      forwardTriggers: forwardTriggerCountRef.current - cur.fwdStart,
+      reverseTriggers: reverseTriggerCountRef.current - cur.revStart,
+      eegPackets: eegBufRef.current.length - cur.eegStart,
+    }
+    setSegments(prev => [...prev, seg])
+    activeSegmentRef.current = null
+    setActiveSegment(null)
+    recordEvent('segment_end', { label: seg.label, note: seg.note ?? '' })
+    const noteSuffix = seg.note ? ` (${seg.note})` : ''
+    const summary = `✓ ${seg.label}${noteSuffix} — ${(seg.durationMs / 1000).toFixed(1)}s, ${seg.eegPackets} EEG, ${seg.forwardTriggers} fwd, ${seg.reverseTriggers} rev`
+    setLastSegmentSummary(summary)
+    addLog(summary)
+    return seg
+  }
+
+  function beginSegmentInternal(label: SegmentLabel, note: string | undefined, now: number) {
+    const seg = {
+      label,
+      note,
+      startTs: now,
+      eegStart: eegBufRef.current.length,
+      fwdStart: forwardTriggerCountRef.current,
+      revStart: reverseTriggerCountRef.current,
+    }
+    activeSegmentRef.current = seg
+    setActiveSegment(seg)
+    setLastSegmentSummary(null)
+    recordEvent('segment_start', { label, note: note ?? '' })
+    addLog(`▸ ${label}${note ? ` (${note})` : ''} segment started`)
+  }
+
+  function toggleSegment(label: SegmentLabel) {
+    if (!recordingRef.current) {
+      addLog('⚠ start a recording first')
+      return
+    }
+    const now = Date.now()
+    if (activeSegment?.label === label) {
+      endSegmentInternal(now)
+      return
+    }
+    if (activeSegment) {
+      endSegmentInternal(now)
+    }
+    beginSegmentInternal(label, undefined, now)
+  }
+
+  function stopRecording() {
+    if (!recordingRef.current) return
+    const now = Date.now()
+    if (activeSegmentRef.current) endSegmentInternal(now)
+    recordingRef.current = false
+    setRecording(false)
+    setHasUnsavedRecording(eegBufRef.current.length > 0 || accelBufRef.current.length > 0 || eventBufRef.current.length > 0)
+    const dur = ((now - recordingStartRef.current) / 1000).toFixed(1)
+    addLog(`■ recording stopped — ${dur}s, ${eegBufRef.current.length} EEG packets`)
+  }
+
+  function saveRecording() {
+    if (eegBufRef.current.length === 0 && accelBufRef.current.length === 0 && eventBufRef.current.length === 0) {
+      addLog('⚠ nothing to save')
+      return
+    }
+    const now = Date.now()
+    const startedAt = new Date(recordingStartRef.current).toISOString()
+    const rec: Recording = {
+      version: 2,
+      startedAt,
+      endedAt: new Date(now).toISOString(),
+      duration: now - recordingStartRef.current,
+      meta: {
+        baseline,
+        forwardSensitivity,
+        reverseSensitivity,
+      },
+      segments,
+      eegPackets: eegBufRef.current,
+      accelSamples: accelBufRef.current,
+      events: eventBufRef.current,
+    }
+    downloadRecording(rec)
+    setHasUnsavedRecording(false)
+    addLog(`saved recording (${(rec.duration / 1000).toFixed(1)}s, ${segments.length} segments)`)
+  }
+
+  // ── Replay (offline tuning against a saved recording) ──────────────
+  async function handleReplayFile(file: File) {
+    try {
+      const text = await file.text()
+      const parsed = JSON.parse(text) as Recording
+      if (parsed.version !== 2) {
+        addLog(`⚠ unsupported recording version: ${parsed.version}`)
+        return
+      }
+      setLoadedRecording(parsed)
+      setReplayFilename(file.name)
+      addLog(`loaded ${file.name} (${parsed.eegPackets.length} EEG packets, ${parsed.segments.length} segments)`)
+      runReplay(parsed)
+    } catch (e) {
+      addLog(`⚠ failed to load: ${e instanceof Error ? e.message : 'unknown'}`)
+    }
+  }
+
+  function runReplay(rec: Recording) {
+    const result = replayRecording(rec, { forwardSensitivity, reverseSensitivity })
+    setReplayResult(result)
+    const dt = (result.totalReplayedForward !== 0 || result.totalReplayedReverse !== 0)
+      ? `${result.totalReplayedForward} fwd, ${result.totalReplayedReverse} rev`
+      : 'no triggers — try lower sensitivity'
+    addLog(`replay done @ fwd ${forwardSensitivity}× / rev ${reverseSensitivity}× → ${dt}`)
+  }
+
+  // ── Guided-protocol runner ─────────────────────────────────────────
+  function startProtocol() {
+    if (museStatus !== 'connected' && !simulating) {
+      addLog('⚠ guided test needs a connected Muse')
+      return
+    }
+    if (!baseline && !simulating) {
+      addLog('⚠ no baseline — click Recalibrate first, then start the test')
+      return
+    }
+    if (recordingRef.current) {
+      addLog('⚠ stop the current recording first')
+      return
+    }
+    if (hasUnsavedRecording && !confirmDiscardUnsaved()) return
+    startRecording()
+    setProtocolRunning(true)
+    setProtocolStepIdx(0)
+    runProtocolStep(0)
+  }
+
+  function runProtocolStep(idx: number) {
+    if (idx >= INTENSITY_PROTOCOL.length) {
+      finishProtocol(false)
+      return
+    }
+    const step = INTENSITY_PROTOCOL[idx]
+    const now = Date.now()
+    setProtocolStepIdx(idx)
+    protocolStepEndsAtRef.current = now + step.durationMs
+    setProtocolStepLeft(Math.ceil(step.durationMs / 1000))
+
+    if (step.type === 'segment') {
+      beginSegmentInternal(step.label, step.note, now)
+    }
+
+    if (protocolTimer.current) clearTimeout(protocolTimer.current)
+    protocolTimer.current = setTimeout(() => {
+      if (step.type === 'segment') endSegmentInternal(Date.now())
+      runProtocolStep(idx + 1)
+    }, step.durationMs)
+  }
+
+  function cancelProtocol() {
+    if (protocolTimer.current) clearTimeout(protocolTimer.current)
+    protocolTimer.current = null
+    setProtocolRunning(false)
+    if (activeSegmentRef.current) endSegmentInternal(Date.now())
+    stopRecording()
+    addLog('guided test cancelled')
+  }
+
+  function finishProtocol(cancelled: boolean) {
+    if (protocolTimer.current) clearTimeout(protocolTimer.current)
+    protocolTimer.current = null
+    setProtocolRunning(false)
+    stopRecording()
+    if (!cancelled) addLog('✓ guided test complete — click Save .json')
+  }
+
+  // Drive the countdown display while a protocol step is active.
+  useEffect(() => {
+    if (!protocolRunning) return
+    const id = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((protocolStepEndsAtRef.current - Date.now()) / 1000))
+      setProtocolStepLeft(remaining)
+    }, 200)
+    return () => clearInterval(id)
+  }, [protocolRunning, protocolStepIdx])
+
+  function discardRecording() {
+    eegBufRef.current = []
+    accelBufRef.current = []
+    eventBufRef.current = []
+    setSegments([])
+    activeSegmentRef.current = null
+    setActiveSegment(null)
+    setLastSegmentSummary(null)
+    setHasUnsavedRecording(false)
+    addLog('recording discarded')
+  }
+
+  function sendRaw(cmd: string) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(cmd)
-      addLog(`→ ${cmd}`)
-    } else {
-      addLog(`⚠ ${cmd}  (car not connected)`)
     }
+  }
+
+  function manualDrive(value: number, label: string) {
+    sendRaw(`drive:${value.toFixed(2)}`)
+    addLog(`→ drive:${value.toFixed(2)} (${label})`)
+    recordEvent('manual_drive', { value, label })
   }
 
   function updateAccel(val: { x: number; y: number; z: number }) {
@@ -62,29 +476,57 @@ export default function Home() {
     accelRef.current = val
   }
 
-  function calibrate() {
+  function calibrateTilt() {
     const offset = accelRef.current.x
     setAccelOffset(offset)
     accelOffsetRef.current = offset
-    addLog(`calibrated — offset ${offset.toFixed(3)}`)
+    addLog(`tilt calibrated — offset ${offset.toFixed(3)}`)
   }
 
-  function triggerBlink() {
-    const now = Date.now()
-    if (now - lastBlinkRef.current < 500) return
-    lastBlinkRef.current = now
-    setBlink(true)
-    setTimeout(() => setBlink(false), 300)
-    sendCommand('blink')
+  function startCalibration() {
+    if (museStatus !== 'connected') {
+      addLog('⚠ calibration needs a connected Muse')
+      return
+    }
+    calibrationAfHigh.current = []
+    calibrationTpHigh.current = []
+    setCalibrating(true)
+    calibratingRef.current = true
+    setCalibrationLeft(Math.round(CALIBRATION_MS / 1000))
+    addLog('calibrating — sit still, don\'t clench or raise eyebrows')
+
+    if (calibrationCountdown.current) clearInterval(calibrationCountdown.current)
+    calibrationCountdown.current = setInterval(() => {
+      setCalibrationLeft(prev => Math.max(0, prev - 1))
+    }, 1000)
+
+    setTimeout(() => {
+      if (calibrationCountdown.current) clearInterval(calibrationCountdown.current)
+      calibratingRef.current = false
+      setCalibrating(false)
+
+      const afHigh = percentile(calibrationAfHigh.current, CALIBRATION_PERCENTILE)
+      const tpHigh = percentile(calibrationTpHigh.current, CALIBRATION_PERCENTILE)
+      if (afHigh < 1 || tpHigh < 1) {
+        addLog('⚠ calibration failed — check contact and retry')
+        return
+      }
+      setBaseline({ afHigh, tpHigh })
+      addLog(`baseline afHigh=${afHigh.toFixed(1)} tpHigh=${tpHigh.toFixed(1)}`)
+      recordEvent('calibration_complete', { afHigh, tpHigh })
+    }, CALIBRATION_MS)
   }
 
-  function triggerClench() {
+  function triggerReverse() {
     const now = Date.now()
-    if (now - lastClenchRef.current < 1000) return
-    lastClenchRef.current = now
-    setJawClench(true)
-    setTimeout(() => setJawClench(false), 500)
-    sendCommand('clench')
+    if (now - lastReverseRef.current < REVERSE_COOLDOWN_MS) return
+    lastReverseRef.current = now
+    reverseUntilRef.current = now + REVERSE_PULSE_MS
+    setReverseActive(true)
+    setTimeout(() => setReverseActive(false), REVERSE_PULSE_MS)
+    addLog('eyebrow → reverse')
+    reverseTriggerCountRef.current++
+    recordEvent('reverse_trigger')
   }
 
   function connectCar() {
@@ -109,51 +551,139 @@ export default function Home() {
       client.accelerometerData.subscribe(data => {
         const s = data.samples[0]
         updateAccel({ x: s.x, y: s.y, z: s.z })
+        if (recordingRef.current) {
+          accelBufRef.current.push({ ts: Date.now(), x: s.x, y: s.y, z: s.z })
+        }
       })
 
       client.eegReadings.subscribe(reading => {
-        const peak = Math.max(...reading.samples.map(Math.abs))
         const e = reading.electrode
+        if (e < 0 || e > 3) return
+
+        detectorRef.current.pushSamples(e, reading.samples)
         const now = Date.now()
 
-        // EMA smoothing for display
-        if (e >= 0 && e <= 3) {
-          eegSmoothed.current[e] = 0.8 * eegSmoothed.current[e] + 0.2 * peak
-          if (now - eegPeakTimestamps.current[e] > 50) {
-            eegPeakTimestamps.current[e] = now
-            const val = eegSmoothed.current[e]
-            setEegPeaks(prev => { const next = [...prev]; next[e] = val; return next })
+        if (recordingRef.current) {
+          eegBufRef.current.push({ ts: now, electrode: e, samples: Array.from(reading.samples) })
+        }
+
+        // All gesture rules + meter UI + calibration sampling run on a single
+        // 20 Hz tick. Doing this at the throttle boundary means the debounce
+        // counter ticks at a stable rate regardless of EEG packet timing.
+        if (now - meterLastUpdate.current <= 50) return
+        meterLastUpdate.current = now
+
+        const f0 = detectorRef.current.features(0)
+        const f1 = detectorRef.current.features(1)
+        const f2 = detectorRef.current.features(2)
+        const f3 = detectorRef.current.features(3)
+        setMeters([f0, f1, f2, f3])
+        setContacts([
+          detectorRef.current.contactQuality(0),
+          detectorRef.current.contactQuality(1),
+          detectorRef.current.contactQuality(2),
+          detectorRef.current.contactQuality(3),
+        ])
+
+        // Raw group means this tick — averaged across the symmetric pair.
+        const afHighRaw = (f1.highRms + f2.highRms) / 2
+        const tpHighRaw = (f0.highRms + f3.highRms) / 2
+
+        // EMA smoothing — α=0.3 gives ~3-tick effective window (~150 ms).
+        afSmoothedRef.current = EMA_ALPHA * afHighRaw + (1 - EMA_ALPHA) * afSmoothedRef.current
+        tpSmoothedRef.current = EMA_ALPHA * tpHighRaw + (1 - EMA_ALPHA) * tpSmoothedRef.current
+        const afHigh = afSmoothedRef.current
+        const tpHigh = tpSmoothedRef.current
+
+        if (calibratingRef.current) {
+          calibrationAfHigh.current.push(afHighRaw)
+          calibrationTpHigh.current.push(tpHighRaw)
+        }
+
+        // Rule evaluation is gated on the threshold refs being finite. We
+        // DO NOT read `baseline` (React state) here — the subscription closure
+        // captures `baseline` at connect time, which is null, and the closure
+        // never sees the post-calibration update. The refs are updated
+        // imperatively by the threshold-derivation useEffect, so reading them
+        // here is the only correct path.
+        if (!calibratingRef.current && Number.isFinite(tpThrFwdRef.current)) {
+          // EMG-ness check (any channel with high ZCR confirms muscle activity).
+          const emgPresent = f0.zcr > CLENCH_MIN_ZCR || f1.zcr > CLENCH_MIN_ZCR ||
+                             f2.zcr > CLENCH_MIN_ZCR || f3.zcr > CLENCH_MIN_ZCR
+
+          // AF/TP ratio — guard div-by-zero against a flatline TP signal.
+          const ratio = afHigh / Math.max(tpHigh, 1)
+
+          // FORWARD (jaw clench): TP-primary rule. On this user/hardware, the
+          // masseter EMG lands almost entirely on TP9/TP10 with AF7/AF8 barely
+          // moving — the textbook "masseter propagates broadly to AF too" model
+          // doesn't fit consumer-EEG electrode placement. See thesis entry
+          // 2026-05-27 for the empirical data. Ratio < 1.6 still discriminates
+          // clench (TP-dominant) from eyebrow (AF-dominant). Requires
+          // FORWARD_DEBOUNCE_TICKS sustained ticks before going active.
+          const forwardRuleNow =
+            emgPresent &&
+            tpHigh > tpThrFwdRef.current &&
+            ratio < CLENCH_MAX_AFTP_RATIO
+          if (forwardRuleNow) {
+            forwardConsecutiveRef.current++
+            if (forwardConsecutiveRef.current >= FORWARD_DEBOUNCE_TICKS) {
+              const intensity = tpHigh / tpThrFwdRef.current
+              const norm = Math.min(1, Math.max(0, (intensity - 1) / (INTENSITY_SATURATION - 1)))
+              forwardSpeedRef.current = MIN_FORWARD + norm * (MAX_FORWARD - MIN_FORWARD)
+              forwardActiveUntilRef.current = now + FORWARD_HOLD_MS
+            }
+          } else {
+            forwardConsecutiveRef.current = 0
+          }
+
+          // REVERSE (eyebrow raise): AF elevated AND AF dominates TP (ratio high).
+          // Auricularis EMG can co-fire with frontalis on some users, lighting up
+          // TP a bit — but never as much as masseter would, so the ratio check
+          // still discriminates. Discrete trigger; suppressed while forward live.
+          const forwardLive = now < forwardActiveUntilRef.current
+          if (
+            !forwardLive &&
+            emgPresent &&
+            afHigh > afThrRevRef.current &&
+            ratio > EYEBROW_MIN_AFTP_RATIO
+          ) {
+            triggerReverse()
           }
         }
 
-        // Blink: rising edge on AF7 (1) or AF8 (2) only.
-        // Reject EMG/forehead artifacts by checking signal smoothness:
-        // blinks are slow EOG deflections (low HF content); forehead/eyebrow movement
-        // is rapid EMG (high HF content). hfRms/peak > 0.4 means spiky → not a blink.
-        // Also suppressed for 500ms after a jaw clench fires (mutual exclusion).
-        if (e === 1 || e === 2) {
-          const s = reading.samples
-          const diffs = s.slice(1).map((v, i) => v - s[i])
-          const hfRms = Math.sqrt(diffs.reduce((sum, d) => sum + d * d, 0) / diffs.length)
-          const isSmooth = peak === 0 || hfRms / peak < 0.4
-          const clenchSuppressed = now - lastClenchRef.current < 500
+        // Mirror gesture state into React state for UI.
+        const fwdLive = now < forwardActiveUntilRef.current
+        setForwardActive(fwdLive)
+        setForwardSpeed(fwdLive ? forwardSpeedRef.current : 0)
+        setLiveSignal({ afEma: afSmoothedRef.current, tpEma: tpSmoothedRef.current })
 
-          if (peak > blinkThresholdRef.current && blinkArmed.current && isSmooth && !clenchSuppressed) {
-            blinkArmed.current = false
-            triggerBlink()
-          } else if (peak <= blinkThresholdRef.current) {
-            blinkArmed.current = true
-          }
+        // Edge-trigger event logging for the recording.
+        if (fwdLive && !forwardWasActiveRef.current) {
+          forwardTriggerCountRef.current++
+          recordEvent('forward_trigger', { speed: forwardSpeedRef.current })
+          forwardWasActiveRef.current = true
+        } else if (!fwdLive && forwardWasActiveRef.current) {
+          recordEvent('forward_end')
+          forwardWasActiveRef.current = false
         }
 
-        // Clench: require 3+ channels to have spiked above threshold within 150ms.
-        // Real jaw clenches hit all channels simultaneously; noise is isolated.
-        if (e >= 0 && e <= 3 && peak > clenchThresholdRef.current) {
-          clenchLastSpike.current[e] = now
-          const active = clenchLastSpike.current.filter(t => now - t < 150).length
-          if (active >= 3) triggerClench()
+        // Throttle the recorder UI counter update to once per second to keep the
+        // re-render rate low while a recording is active.
+        if (recordingRef.current && now - recordingStartRef.current >= 0) {
+          if (Math.floor((now - recordingStartRef.current) / 1000) !==
+              Math.floor((now - 50 - recordingStartRef.current) / 1000)) {
+            setRecordingTickStats({
+              eeg: eegBufRef.current.length,
+              accel: accelBufRef.current.length,
+              events: eventBufRef.current.length,
+              seconds: Math.floor((now - recordingStartRef.current) / 1000),
+            })
+          }
         }
       })
+
+      setTimeout(() => startCalibration(), 500)
     } catch (e) {
       setMuseStatus('error')
       setMuseError(e instanceof Error ? e.message : 'Connection failed')
@@ -164,8 +694,13 @@ export default function Home() {
     setSimulating(true)
     const start = Date.now()
     simTimers.current = [
-      setInterval(() => triggerBlink(), 3000),
-      setInterval(() => triggerClench(), 7000),
+      // Pretend forward gesture every 4s for 1.5s with varying intensity
+      setInterval(() => {
+        const intensity = 0.4 + Math.random() * 0.5
+        forwardSpeedRef.current = intensity
+        forwardActiveUntilRef.current = Date.now() + 1500
+      }, 4000),
+      setInterval(() => triggerReverse(), 9000),
       setInterval(() => {
         const t = (Date.now() - start) / 1000
         updateAccel({
@@ -173,6 +708,9 @@ export default function Home() {
           y: Math.cos(t * 0.3) * 0.2,
           z: 1 + Math.sin(t * 0.8) * 0.05,
         })
+        const fwdLive = Date.now() < forwardActiveUntilRef.current
+        setForwardActive(fwdLive)
+        setForwardSpeed(fwdLive ? forwardSpeedRef.current : 0)
       }, 100),
     ]
     addLog('simulate started')
@@ -182,18 +720,41 @@ export default function Home() {
     simTimers.current.forEach(clearInterval)
     simTimers.current = []
     setSimulating(false)
+    forwardActiveUntilRef.current = 0
+    reverseUntilRef.current = 0
+    setForwardActive(false)
+    setForwardSpeed(0)
     addLog('simulate stopped')
   }
 
-  // Stream steering to car every 100ms when connected.
-  // Subtracts calibration offset and applies dead zone before sending.
+  // Streaming loop: send steer always, drive only when gesture-active.
+  // When transitioning out of any drive state, send drive:0 once so the car
+  // stops immediately instead of waiting on the watchdog.
   useEffect(() => {
     if (carStatus !== 'connected') return
     const id = setInterval(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        const raw = accelRef.current.x - accelOffsetRef.current
-        const steer = Math.abs(raw) < DEAD_ZONE ? 0 : raw
-        wsRef.current.send(`steer:${steer.toFixed(3)}`)
+      if (wsRef.current?.readyState !== WebSocket.OPEN) return
+      const now = Date.now()
+
+      const raw = accelRef.current.x - accelOffsetRef.current
+      const steer = Math.abs(raw) < DEAD_ZONE ? 0 : raw
+      wsRef.current.send(`steer:${steer.toFixed(3)}`)
+
+      const reverseLive = now < reverseUntilRef.current
+      const forwardLive = !reverseLive && now < forwardActiveUntilRef.current
+
+      if (reverseLive) {
+        wsRef.current.send(`drive:${(-REVERSE_SPEED).toFixed(2)}`)
+        drivingFlagRef.current = true
+        if (recordingRef.current) recordEvent('drive_sent', { value: -REVERSE_SPEED })
+      } else if (forwardLive) {
+        wsRef.current.send(`drive:${forwardSpeedRef.current.toFixed(2)}`)
+        drivingFlagRef.current = true
+        if (recordingRef.current) recordEvent('drive_sent', { value: forwardSpeedRef.current })
+      } else if (drivingFlagRef.current) {
+        wsRef.current.send('drive:0')
+        drivingFlagRef.current = false
+        if (recordingRef.current) recordEvent('drive_sent', { value: 0 })
       }
     }, 100)
     return () => clearInterval(id)
@@ -201,8 +762,31 @@ export default function Home() {
 
   useEffect(() => () => {
     simTimers.current.forEach(clearInterval)
+    if (calibrationCountdown.current) clearInterval(calibrationCountdown.current)
+    if (protocolTimer.current) clearTimeout(protocolTimer.current)
     wsRef.current?.close()
   }, [])
+
+  // Keyboard shortcuts for segment toggling while recording.
+  //   1 → clench    2 → eyebrow    3 → tilt    0 → rest
+  // Same key toggles the segment on/off; switching directly between labels
+  // closes the current segment and opens the new one.
+  // Ignored while typing in input fields.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement
+      if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA') return
+      if (protocolRunning) return    // protocol drives segments automatically
+      if (e.key === '1') toggleSegment('clench')
+      else if (e.key === '2') toggleSegment('eyebrow')
+      else if (e.key === '3') toggleSegment('tilt')
+      else if (e.key === '0') toggleSegment('rest')
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+    // toggleSegment reads refs and stable state setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSegment, protocolRunning])
 
   const museLabel =
     museStatus === 'connecting' ? 'Connecting…' :
@@ -217,13 +801,38 @@ export default function Home() {
     'Connect car'
 
   const carConnected = carStatus === 'connected'
+  const channelLabels = ['TP9', 'AF7', 'AF8', 'TP10'] as const
+  const contactColor = (q: ContactQuality) =>
+    q === 'good' ? 'bg-emerald-500' : q === 'fair' ? 'bg-yellow-500' : 'bg-red-500'
+
+  const tpThrFwd = baseline ? baseline.tpHigh * forwardSensitivity : 0
+  const afThrRev = baseline ? baseline.afHigh * reverseSensitivity : 0
+
+  // Live AF/TP ratio for the dashboard — useful for diagnosing whether the
+  // discriminator can tell clench from eyebrow. Computed from the meters state
+  // (which is updated every 50 ms) rather than the EMA refs, so React re-renders
+  // pick it up; the value is close enough to the smoothed signal for diagnosis.
+  const afLive = (meters[1].highRms + meters[2].highRms) / 2
+  const tpLive = (meters[0].highRms + meters[3].highRms) / 2
+  const liveRatio = afLive / Math.max(tpLive, 1)
 
   return (
     <main className="min-h-screen bg-gray-900 text-white p-8">
       <h1 className="text-3xl font-bold mb-1">Brain Car Dashboard</h1>
-      <p className="text-gray-400 mb-8 text-sm">Phases 1–4 complete · Adafruit TB6612 pending</p>
+      <p className="text-gray-400 mb-8 text-sm">Clench → forward (variable speed) · eyebrow → reverse · tilt → steer</p>
 
-      {/* Controls */}
+      {calibrating && (
+        <div className="mb-6 p-4 rounded-lg bg-blue-900/40 border border-blue-700 max-w-3xl">
+          <div className="flex items-center gap-4">
+            <div className="text-2xl font-mono">{calibrationLeft}s</div>
+            <div>
+              <p className="font-semibold">Calibrating noise floor…</p>
+              <p className="text-sm text-blue-200">Sit still — no clenching, no eyebrow raises. Contact dots must be green.</p>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center gap-3 mb-6">
         <button
           onClick={connectMuse}
@@ -231,6 +840,14 @@ export default function Home() {
           className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-3 rounded-lg font-medium transition-colors"
         >
           {museLabel}
+        </button>
+
+        <button
+          onClick={startCalibration}
+          disabled={museStatus !== 'connected' || calibrating}
+          className="bg-purple-700 hover:bg-purple-600 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-3 rounded-lg font-medium transition-colors"
+        >
+          Recalibrate
         </button>
 
         <div className="flex items-center gap-2">
@@ -263,26 +880,25 @@ export default function Home() {
         {museError && <p className="text-red-400 text-sm">{museError}</p>}
       </div>
 
-      {/* Manual controls */}
       <div className="max-w-3xl mb-8">
-        <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Manual control</p>
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Manual control (one-shot, ~500 ms via car watchdog)</p>
         <div className="flex gap-3">
           <button
-            onClick={() => sendCommand('blink')}
+            onClick={() => manualDrive(0.7, 'manual forward')}
             disabled={!carConnected}
             className="bg-yellow-600 hover:bg-yellow-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-medium transition-colors"
           >
             Forward
           </button>
           <button
-            onClick={() => sendCommand('clench')}
+            onClick={() => manualDrive(-0.7, 'manual reverse')}
             disabled={!carConnected}
             className="bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-medium transition-colors"
           >
             Reverse
           </button>
           <button
-            onClick={() => sendCommand('stop')}
+            onClick={() => manualDrive(0, 'stop')}
             disabled={!carConnected}
             className="bg-gray-600 hover:bg-gray-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-medium transition-colors"
           >
@@ -291,19 +907,365 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Sensor cards */}
-      <div className="grid grid-cols-3 gap-6 max-w-3xl mb-8">
-        <div className={`p-6 rounded-xl transition-colors duration-100 ${blink ? 'bg-yellow-500' : 'bg-gray-800'}`}>
-          <h2 className="text-lg font-semibold">Blink</h2>
-          <p className="text-5xl font-mono mt-3 mb-4">{blink ? 'YES' : '—'}</p>
-          <p className="text-xs text-gray-400">AF7 / AF8 · rising edge</p>
-        </div>
+      <div className="max-w-3xl mb-8">
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Replay saved recording</p>
+        <div className="bg-gray-800 rounded-xl p-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="bg-indigo-700 hover:bg-indigo-600 px-4 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer">
+              Load .json
+              <input
+                type="file"
+                accept=".json,application/json"
+                onChange={e => {
+                  const f = e.target.files?.[0]
+                  if (f) handleReplayFile(f)
+                  e.target.value = ''
+                }}
+                className="hidden"
+              />
+            </label>
+            <button
+              onClick={() => loadedRecording && runReplay(loadedRecording)}
+              disabled={!loadedRecording}
+              className="bg-purple-700 hover:bg-purple-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+              title="Re-run with current sensitivity sliders"
+            >
+              Re-run with current settings
+            </button>
+            {replayFilename && (
+              <span className="text-xs text-gray-400 font-mono">{replayFilename}</span>
+            )}
+          </div>
 
-        <div className={`p-6 rounded-xl transition-colors duration-100 ${jawClench ? 'bg-red-500' : 'bg-gray-800'}`}>
-          <h2 className="text-lg font-semibold">Jaw Clench</h2>
-          <p className="text-5xl font-mono mt-3 mb-4">{jawClench ? 'YES' : '—'}</p>
-          <p className="text-xs text-gray-400">3+ channels within 150ms</p>
+          {replayResult && (
+            <div className="mt-4">
+              <div className="text-xs text-gray-500 mb-2">
+                Replayed with: forward {replayResult.config.forwardSensitivity}× / reverse {replayResult.config.reverseSensitivity}×
+                {replayResult.config.baselineTpHigh != null && (
+                  <span> · baseline tpHigh={replayResult.config.baselineTpHigh.toFixed(1)} afHigh={replayResult.config.baselineAfHigh?.toFixed(1)}</span>
+                )}
+              </div>
+              <div className="space-y-1 text-sm font-mono">
+                <div className="grid grid-cols-5 gap-2 text-xs text-gray-500 pb-1 border-b border-gray-700">
+                  <span>#</span>
+                  <span>segment</span>
+                  <span className="text-right">orig fwd/rev</span>
+                  <span className="text-right">replay fwd/rev</span>
+                  <span className="text-right">change</span>
+                </div>
+                {replayResult.segments.map((s, i) => {
+                  const fwdDelta = s.replayedForward - s.originalForward
+                  const revDelta = s.replayedReverse - s.originalReverse
+                  const fmt = (n: number) => n > 0 ? `+${n}` : `${n}`
+                  return (
+                    <div key={i} className="grid grid-cols-5 gap-2">
+                      <span className="text-gray-500">{i + 1}.</span>
+                      <span className={
+                        s.label === 'clench'  ? 'text-yellow-400' :
+                        s.label === 'eyebrow' ? 'text-red-400' :
+                        s.label === 'tilt'    ? 'text-blue-400' :
+                                                'text-gray-300'
+                      }>{s.label}{s.note ? ` (${s.note})` : ''}</span>
+                      <span className="text-right text-gray-400">{s.originalForward}/{s.originalReverse}</span>
+                      <span className="text-right text-gray-200">{s.replayedForward}/{s.replayedReverse}</span>
+                      <span className="text-right text-gray-500">{fmt(fwdDelta)}/{fmt(revDelta)}</span>
+                    </div>
+                  )
+                })}
+                <div className="grid grid-cols-5 gap-2 pt-2 border-t border-gray-700 text-gray-300">
+                  <span></span>
+                  <span className="text-gray-500">total replay</span>
+                  <span></span>
+                  <span className="text-right">{replayResult.totalReplayedForward}/{replayResult.totalReplayedReverse}</span>
+                  <span></span>
+                </div>
+              </div>
+
+              {/* Validation metrics block */}
+              {(() => {
+                const m = replayResult.metrics
+                const pct = (x: number) => `${(x * 100).toFixed(0)}%`
+                const ms = (x: number | null) => x === null ? '—' : `${x.toFixed(0)} ms`
+                return (
+                  <div className="mt-5 pt-4 border-t border-gray-700">
+                    <p className="text-xs text-gray-500 uppercase tracking-widest mb-3">
+                      Validation metrics · expected {m.expectedRepsPerSegment} reps per gesture segment
+                    </p>
+                    <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                      <div>
+                        <span className="text-gray-500">Clench hit rate</span>
+                        <span className="float-right font-mono">
+                          <span className="text-yellow-300">{pct(m.clenchHitRate)}</span>
+                          <span className="text-gray-500 ml-2 text-xs">
+                            ({m.clenchTriggers}/{m.clenchSegments * m.expectedRepsPerSegment})
+                          </span>
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500">Eyebrow hit rate</span>
+                        <span className="float-right font-mono">
+                          <span className="text-red-300">{pct(m.eyebrowHitRate)}</span>
+                          <span className="text-gray-500 ml-2 text-xs">
+                            ({m.eyebrowTriggers}/{m.eyebrowSegments * m.expectedRepsPerSegment})
+                          </span>
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500">False positives (rest)</span>
+                        <span className="float-right font-mono">
+                          <span className={m.restFalsePositives > 0 ? 'text-orange-300' : 'text-emerald-400'}>
+                            {m.restFalsePositives}
+                          </span>
+                          <span className="text-gray-500 ml-2 text-xs">
+                            ({m.falsePositivesPerMinute.toFixed(1)}/min over {m.restDurationSec.toFixed(1)}s rest)
+                          </span>
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500">Mean first-trigger latency</span>
+                        <span className="float-right font-mono text-gray-200">{ms(m.meanFirstTriggerLatencyMs)}</span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500">Mean inter-trigger interval</span>
+                        <span className="float-right font-mono text-gray-200">{ms(m.meanInterTriggerIntervalMs)}</span>
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-600 mt-3 leading-relaxed">
+                      Hit rate = triggers ÷ (segments × expected reps). Can exceed 100% if the detector double-fires per gesture.
+                      First-trigger latency = time from segment start to first detection (lower = quicker pickup, but depends on how soon you started the gesture after the segment opened).
+                      Inter-trigger interval = average gap between consecutive triggers within a clench segment (close to your intended ~3 s rest between reps = good).
+                    </p>
+                  </div>
+                )
+              })()}
+            </div>
+          )}
         </div>
+        <p className="text-xs text-gray-500 mt-2">
+          Load any saved <span className="font-mono">.json</span> recording, then change the sensitivity sliders below and click <em>Re-run</em> to see how the rule would have performed with the new settings. No headset required.
+        </p>
+      </div>
+
+      <div className="max-w-3xl mb-8">
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Recording</p>
+        <div className="bg-gray-800 rounded-xl p-4">
+          <div className="flex flex-wrap items-center gap-3">
+            {!recording ? (
+              <>
+                <button
+                  onClick={startRecording}
+                  disabled={museStatus !== 'connected' && !simulating}
+                  className="bg-red-600 hover:bg-red-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-5 py-2.5 rounded-lg font-medium transition-colors"
+                >
+                  ● Start recording
+                </button>
+                <button
+                  onClick={startProtocol}
+                  disabled={(museStatus !== 'connected' && !simulating) || (!baseline && !simulating)}
+                  className="bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-5 py-2.5 rounded-lg font-medium transition-colors"
+                  title={!baseline ? 'Recalibrate first — no baseline' : 'Scripted clench-intensity test (~1m45s)'}
+                >
+                  ▶ Start guided test{!baseline && museStatus === 'connected' ? ' (calibrate first)' : ''}
+                </button>
+              </>
+            ) : protocolRunning ? (
+              <button
+                onClick={cancelProtocol}
+                className="bg-orange-700 hover:bg-orange-600 px-5 py-2.5 rounded-lg font-medium transition-colors"
+              >
+                ✕ Cancel guided test
+              </button>
+            ) : (
+              <button
+                onClick={stopRecording}
+                className="bg-gray-700 hover:bg-gray-600 px-5 py-2.5 rounded-lg font-medium transition-colors"
+              >
+                ■ Stop session
+              </button>
+            )}
+            {(hasUnsavedRecording || recording) && (
+              <>
+                <button
+                  onClick={saveRecording}
+                  disabled={recording}
+                  className="bg-emerald-700 hover:bg-emerald-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                >
+                  Save .json
+                </button>
+                <button
+                  onClick={discardRecording}
+                  disabled={recording}
+                  className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                >
+                  Discard
+                </button>
+              </>
+            )}
+            {recording && (
+              <div className="flex items-center gap-3 text-sm text-gray-400 ml-auto">
+                <span className="inline-block w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                <span className="font-mono">{recordingTickStats.seconds}s</span>
+                <span className="font-mono text-xs text-gray-500">
+                  {recordingTickStats.eeg} EEG · {recordingTickStats.accel} accel · {recordingTickStats.events} events
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Guided-test live banner */}
+          {protocolRunning && (() => {
+            const step = INTENSITY_PROTOCOL[protocolStepIdx]
+            const totalSec = Math.ceil(step.durationMs / 1000)
+            const pct = Math.max(0, Math.min(100, (1 - protocolStepLeft / totalSec) * 100))
+            return (
+              <div className="mt-4 p-4 rounded-lg bg-indigo-900/40 border border-indigo-700">
+                <div className="flex items-baseline gap-4 mb-2">
+                  <div className="text-3xl font-mono">{protocolStepLeft}s</div>
+                  <div className="text-xs text-indigo-300 uppercase tracking-widest">
+                    Step {protocolStepIdx + 1} of {INTENSITY_PROTOCOL.length}
+                    {step.type === 'segment' && (
+                      <span className="ml-2 px-1.5 py-0.5 rounded bg-indigo-700/60 text-indigo-100 normal-case tracking-normal">
+                        {step.label}{step.note ? ` · ${step.note}` : ''}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <p className="text-lg font-semibold">
+                  {step.type === 'segment' ? step.instruction : step.text}
+                </p>
+                <div className="h-1.5 w-full bg-indigo-950/60 rounded mt-3 overflow-hidden">
+                  <div className="h-full bg-indigo-400 transition-all duration-200" style={{ width: `${pct}%` }} />
+                </div>
+              </div>
+            )
+          })()}
+
+          {/* Segment buttons — hidden while a guided protocol is running */}
+          {recording && !protocolRunning && (
+            <>
+              <div className="mt-4 flex flex-wrap gap-2">
+                {(['clench', 'eyebrow', 'tilt', 'rest'] as SegmentLabel[]).map((label, idx) => {
+                  const isActive = activeSegment?.label === label
+                  const baseStyle = {
+                    clench:  'bg-yellow-700 hover:bg-yellow-600',
+                    eyebrow: 'bg-red-800 hover:bg-red-700',
+                    tilt:    'bg-blue-800 hover:bg-blue-700',
+                    rest:    'bg-gray-600 hover:bg-gray-500',
+                  }[label]
+                  const activeStyle = {
+                    clench:  'bg-yellow-500 ring-2 ring-yellow-300',
+                    eyebrow: 'bg-red-500 ring-2 ring-red-300',
+                    tilt:    'bg-blue-500 ring-2 ring-blue-300',
+                    rest:    'bg-gray-400 ring-2 ring-gray-200',
+                  }[label]
+                  const key = label === 'rest' ? 0 : idx + 1
+                  return (
+                    <button
+                      key={label}
+                      onClick={() => toggleSegment(label)}
+                      className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${isActive ? activeStyle : baseStyle}`}
+                    >
+                      {isActive ? `■ End ${label} (${key})` : `▸ Start ${label} (${key})`}
+                    </button>
+                  )
+                })}
+              </div>
+
+              {activeSegment && (
+                <div className="mt-3 px-3 py-2 rounded bg-gray-900/60 border border-gray-700 text-sm text-gray-300 inline-block">
+                  <span className="font-mono mr-2">●</span>
+                  Recording <span className="font-mono text-white">{activeSegment.label}</span> segment —
+                  press the same button (or key) again to end
+                </div>
+              )}
+
+              {lastSegmentSummary && !activeSegment && (
+                <div className="mt-3 px-3 py-2 rounded bg-emerald-900/30 border border-emerald-700 text-sm text-emerald-200 inline-block">
+                  {lastSegmentSummary}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Captured segments list */}
+          {segments.length > 0 && (
+            <div className="mt-4">
+              <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Captured segments ({segments.length})</p>
+              <div className="space-y-1 text-sm">
+                {segments.map((s, i) => (
+                  <div key={i} className="flex items-baseline gap-3 font-mono text-gray-400">
+                    <span className="text-gray-500 w-6 text-right">{i + 1}.</span>
+                    <span className={
+                      s.label === 'clench'  ? 'text-yellow-400 w-20' :
+                      s.label === 'eyebrow' ? 'text-red-400 w-20' :
+                      s.label === 'tilt'    ? 'text-blue-400 w-20' :
+                                              'text-gray-300 w-20'
+                    }>{s.label}</span>
+                    <span className="text-gray-300">{(s.durationMs / 1000).toFixed(1)}s</span>
+                    <span className="text-gray-500 text-xs">
+                      {s.eegPackets} EEG · {s.forwardTriggers} fwd · {s.reverseTriggers} rev
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+        <p className="text-xs text-gray-500 mt-2">
+          Workflow: start session → click a segment button to begin (or press <span className="font-mono">1</span>/<span className="font-mono">2</span>/<span className="font-mono">3</span>/<span className="font-mono">0</span>) → perform the gesture → click again to end → review summary → next segment or stop.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-3 gap-6 max-w-3xl mb-8">
+        {/* Forward card: always-on bar. Height = liveTpEma / tpThr_fwd (0–150%).
+            A 100% threshold marker shows where the rule would fire. When
+            forwardActive (debounce passed), the card background flashes yellow. */}
+        {(() => {
+          const haveBaseline = baseline !== null
+          const liveTpPct = haveBaseline ? Math.min(150, (liveSignal.tpEma / Math.max(tpThrFwd, 1)) * 100) : 0
+          const liveAfPct = haveBaseline ? Math.min(150, (liveSignal.afEma / Math.max(afThrRev, 1)) * 100) : 0
+          return (
+            <>
+              <div className={`p-6 rounded-xl transition-colors duration-100 ${forwardActive ? 'bg-yellow-500' : 'bg-gray-800'}`}>
+                <h2 className="text-lg font-semibold">Forward</h2>
+                <p className="text-5xl font-mono mt-3 mb-1">
+                  {forwardActive ? `${Math.round(forwardSpeed * 100)}%`
+                    : haveBaseline ? `${Math.round(liveTpPct)}%` : '—'}
+                </p>
+                <div className="relative h-4 w-full bg-gray-900/70 ring-1 ring-gray-700 rounded mt-2 mb-3 overflow-hidden">
+                  <div className="h-full bg-yellow-400 transition-all duration-75"
+                       style={{ width: haveBaseline ? `${Math.min(100, liveTpPct / 1.5 * 100)}%` : '0%' }} />
+                  {haveBaseline && (
+                    <div className="absolute top-0 bottom-0 border-l-2 border-yellow-200/90"
+                         style={{ left: '66.6%' }} title="threshold (100%)" />
+                  )}
+                </div>
+                <p className="text-xs text-gray-400">
+                  {haveBaseline ? 'jaw clench · TP · ▸ marker = threshold' : 'calibrate to enable'}
+                </p>
+              </div>
+
+              <div className={`p-6 rounded-xl transition-colors duration-100 ${reverseActive ? 'bg-red-500' : 'bg-gray-800'}`}>
+                <h2 className="text-lg font-semibold">Reverse</h2>
+                <p className="text-5xl font-mono mt-3 mb-1">
+                  {reverseActive ? 'YES'
+                    : haveBaseline ? `${Math.round(liveAfPct)}%` : '—'}
+                </p>
+                <div className="relative h-4 w-full bg-gray-900/70 ring-1 ring-gray-700 rounded mt-2 mb-3 overflow-hidden">
+                  <div className="h-full bg-red-400 transition-all duration-75"
+                       style={{ width: haveBaseline ? `${Math.min(100, liveAfPct / 1.5 * 100)}%` : '0%' }} />
+                  {haveBaseline && (
+                    <div className="absolute top-0 bottom-0 border-l-2 border-red-200/90"
+                         style={{ left: '66.6%' }} title="threshold (100%)" />
+                  )}
+                </div>
+                <p className="text-xs text-gray-400">
+                  {haveBaseline ? 'eyebrow raise · AF · ▸ marker = threshold' : 'calibrate to enable'}
+                </p>
+              </div>
+            </>
+          )
+        })()}
 
         <div className={`p-6 rounded-xl bg-gray-800 ${carConnected ? 'ring-1 ring-emerald-600' : ''}`}>
           <h2 className="text-lg font-semibold">Head Tilt</h2>
@@ -312,112 +1274,137 @@ export default function Home() {
             <p>Y: {accel.y.toFixed(3)}</p>
             <p>Z: {accel.z.toFixed(3)}</p>
           </div>
-          <p className="text-xs text-gray-500 mb-3">
-            dead zone ±{DEAD_ZONE}
-          </p>
+          <p className="text-xs text-gray-500 mb-3">dead zone ±{DEAD_ZONE}</p>
           <button
-            onClick={calibrate}
+            onClick={calibrateTilt}
             disabled={museStatus !== 'connected' && !simulating}
             className="text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded font-medium transition-colors"
           >
-            Calibrate
+            Calibrate tilt
           </button>
         </div>
       </div>
 
-      {/* Threshold sliders */}
       <div className="max-w-3xl mb-8">
-        <p className="text-xs text-gray-500 uppercase tracking-widest mb-3">Thresholds</p>
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-3">Sensitivity</p>
         <div className="grid grid-cols-2 gap-6 bg-gray-800 rounded-xl p-4">
           <div>
             <label className="text-sm text-gray-300 mb-2 block">
-              Blink — {blinkThreshold} μV
+              Forward (clench) — {forwardSensitivity.toFixed(1)}×
+              {baseline && (
+                <span className="text-gray-500"> (TP threshold {tpThrFwd.toFixed(0)})</span>
+              )}
             </label>
             <input
-              type="range" min={50} max={300} value={blinkThreshold}
+              type="range"
+              min={SENSITIVITY_MIN} max={SENSITIVITY_MAX} step={0.5}
+              value={forwardSensitivity}
               onChange={e => {
                 const v = Number(e.target.value)
-                setBlinkThreshold(v)
-                blinkThresholdRef.current = v
-                localStorage.setItem('blinkThreshold', String(v))
+                setForwardSensitivity(v)
+                localStorage.setItem('forwardSensitivity.v5', String(v))
               }}
               className="w-full accent-yellow-500"
             />
             <div className="flex justify-between text-xs text-gray-600 mt-1">
-              <span>50</span><span>300</span>
+              <span>{SENSITIVITY_MIN}× (loose)</span><span>{SENSITIVITY_MAX}× (strict)</span>
             </div>
           </div>
           <div>
             <label className="text-sm text-gray-300 mb-2 block">
-              Jaw clench — {clenchThreshold} μV
+              Reverse (eyebrow) — {reverseSensitivity.toFixed(1)}×
+              {baseline && (
+                <span className="text-gray-500"> (AF {afThrRev.toFixed(0)}, ratio &gt; {EYEBROW_MIN_AFTP_RATIO})</span>
+              )}
             </label>
             <input
-              type="range" min={100} max={400} value={clenchThreshold}
+              type="range"
+              min={SENSITIVITY_MIN} max={SENSITIVITY_MAX} step={0.5}
+              value={reverseSensitivity}
               onChange={e => {
                 const v = Number(e.target.value)
-                setClenchThreshold(v)
-                clenchThresholdRef.current = v
-                localStorage.setItem('clenchThreshold', String(v))
+                setReverseSensitivity(v)
+                localStorage.setItem('reverseSensitivity.v5', String(v))
               }}
               className="w-full accent-red-500"
             />
             <div className="flex justify-between text-xs text-gray-600 mt-1">
-              <span>100</span><span>400</span>
+              <span>{SENSITIVITY_MIN}× (loose)</span><span>{SENSITIVITY_MAX}× (strict)</span>
             </div>
           </div>
         </div>
+        {!baseline && museStatus === 'connected' && (
+          <p className="text-xs text-yellow-500 mt-2">Detection disabled — run calibration first.</p>
+        )}
       </div>
 
-      {/* EEG signal meters */}
       <div className="max-w-3xl mb-8">
-        <p className="text-xs text-gray-500 uppercase tracking-widest mb-3">EEG signal · μV (max 500)</p>
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-3">High-band per channel (clench/eyebrow signal) · contact dots: green/yellow/red</p>
         <div className="bg-gray-800 rounded-xl p-4">
-          <div className="flex gap-4 items-end justify-around">
-            {(['TP9', 'AF7', 'AF8', 'TP10'] as const).map((label, i) => {
-              const MAX = 500
-              const peak = eegPeaks[i]
-              const fillPct = Math.min(peak / MAX * 100, 100)
-              const blinkPct = Math.min(blinkThreshold / MAX * 100, 100)
-              const clenchPct = Math.min(clenchThreshold / MAX * 100, 100)
-              const isBlinkCh = i === 1 || i === 2
-              const aboveBlink = isBlinkCh && peak > blinkThreshold
-              const aboveClench = peak > clenchThreshold
-              const barColor = aboveClench ? 'bg-red-500' : aboveBlink ? 'bg-yellow-400' : 'bg-blue-500'
+          <div className="flex gap-6 items-end justify-around">
+            {channelLabels.map((label, i) => {
+              const MAX = Math.max(50, tpThrFwd * 1.8, afThrRev * 1.8)
+              const f = meters[i]
+              const highPct = Math.min(f.highRms / MAX * 100, 100)
+              const isAf = i === 1 || i === 2
+              // Threshold lines reflect what each channel actually contributes
+              // to detection on this hardware:
+              //  • AF channels: reverse gate (red) — eyebrow firing line
+              //  • TP channels: forward gate (yellow) — clench firing line
+              // Forward is TP-primary; AF doesn't track masseter strongly on
+              // this user, so showing a forward line on AF would be misleading.
+              const yellowThr = isAf ? 0 : tpThrFwd
+              const redThr    = isAf ? afThrRev : 0
+              const yellowPct = Math.min(yellowThr / MAX * 100, 100)
+              const redPct    = Math.min(redThr / MAX * 100, 100)
               return (
                 <div key={label} className="flex flex-col items-center gap-2 flex-1">
-                  <span className="text-xs font-mono text-gray-400">{Math.round(peak)}</span>
+                  <div className={`w-2.5 h-2.5 rounded-full ${contactColor(contacts[i])}`} title={`raw RMS ${f.rawRms.toFixed(1)} μV — ${contacts[i]}`} />
+                  <span className="text-xs font-mono text-gray-400">H{Math.round(f.highRms)}</span>
                   <div className="relative w-full h-36 bg-gray-700 rounded overflow-hidden">
-                    {/* bar fill */}
                     <div
-                      className={`absolute bottom-0 w-full transition-all duration-75 ${barColor}`}
-                      style={{ height: `${fillPct}%` }}
+                      className="absolute bottom-0 w-full bg-red-500 transition-all duration-75"
+                      style={{ height: `${highPct}%` }}
                     />
-                    {/* clench threshold line */}
-                    <div
-                      className="absolute w-full border-t border-red-400 border-dashed"
-                      style={{ bottom: `${clenchPct}%` }}
-                    />
-                    {/* blink threshold line — only on AF7/AF8 */}
-                    {isBlinkCh && (
-                      <div
-                        className="absolute w-full border-t border-yellow-400 border-dashed"
-                        style={{ bottom: `${blinkPct}%` }}
-                      />
+                    {baseline && (
+                      <>
+                        {yellowThr > 0 && (
+                          <div
+                            className="absolute w-full border-t border-yellow-400 border-dashed"
+                            style={{ bottom: `${yellowPct}%` }}
+                            title="forward gate (TP)"
+                          />
+                        )}
+                        {redThr > 0 && (
+                          <div
+                            className="absolute w-full border-t border-red-300 border-dashed"
+                            style={{ bottom: `${redPct}%` }}
+                            title="reverse gate (AF)"
+                          />
+                        )}
+                      </>
                     )}
                   </div>
                   <span className="text-xs text-gray-400">{label}</span>
+                  <span className="text-[10px] font-mono text-gray-500">zcr {f.zcr.toFixed(2)}</span>
                 </div>
               )
             })}
           </div>
-          <div className="flex gap-4 mt-3 text-xs text-gray-500">
-            <span><span className="text-yellow-400">—</span> blink threshold (AF7/AF8)</span>
-            <span><span className="text-red-400">—</span> clench threshold (all)</span>
+          <div className="flex flex-wrap gap-4 mt-3 text-xs text-gray-500">
+            <span>H = EMA-smoothed high-band RMS (20+ Hz)</span>
+            <span><span className="text-yellow-400">─</span> forward gate — TP must clear (clench)</span>
+            <span><span className="text-red-300">─</span> reverse gate — AF must clear (eyebrow)</span>
+            {baseline && (
+              <span className="text-gray-400">
+                live AF/TP ratio: <span className="font-mono">{liveRatio.toFixed(2)}</span>
+                {' '}<span className="text-gray-600">(&lt;{CLENCH_MAX_AFTP_RATIO}=clench, &gt;{EYEBROW_MIN_AFTP_RATIO}=eyebrow)</span>
+              </span>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Command log */}
       <div className="max-w-3xl">
         <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Command log</p>
         <div className="bg-gray-800 rounded-xl p-4 font-mono text-sm min-h-20">

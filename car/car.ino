@@ -16,29 +16,46 @@ const char* password = "jon42027";
 #define BIN2  16
 #define STBY  17
 
-WebSocketsServer ws(81);
+// Drive value in [-1, 1]. Positive = forward, negative = reverse,
+// magnitude = speed. Updated via the `drive:X` WebSocket command.
+float driveValue = 0.0;
+float steerValue = 0.0;
+unsigned long lastDriveMsg = 0;
 
-enum DriveState { IDLE, FORWARD, REVERSE };
-DriveState driveState = IDLE;
-float steerValue  = 0.0;   // -1.0 = full left, +1.0 = full right
-unsigned long driveUntil = 0;
+// Safety watchdog — if no drive: command arrives within this window the motors
+// stop. Protects against laptop disconnect / browser tab crash while moving.
+const unsigned long WATCHDOG_MS = 500;
+
+// PWM scaling. Below MIN_PWM the motors don't actually spin (stiction).
+const int MIN_PWM = 120;
+const int MAX_PWM = 255;
+const float DRIVE_DEADZONE = 0.05;
+// Differential steering offset as a fraction of base PWM.
+const float STEER_DIFFERENTIAL = 0.35;
+
+WebSocketsServer ws(81);
 
 void motorsOff() {
   digitalWrite(STBY, LOW);
+  ledcWrite(PWMA, 0);
+  ledcWrite(PWMB, 0);
 }
 
-// Called every loop — applies current driveState + steerValue to motors.
-// Differential steering: steerValue shifts power between left and right.
+// Called every loop — applies current driveValue + steerValue to motors.
 void applyMotors() {
-  if (driveState == IDLE) {
+  if (millis() - lastDriveMsg > WATCHDOG_MS || fabs(driveValue) < DRIVE_DEADZONE) {
     motorsOff();
     return;
   }
-  int leftSpeed  = constrain(180 + (int)(steerValue * 80), 0, 255);
-  int rightSpeed = constrain(180 - (int)(steerValue * 80), 0, 255);
+  bool forward = driveValue > 0;
+  float mag = fabs(driveValue);
+  int basePWM  = MIN_PWM + (int)(mag * (MAX_PWM - MIN_PWM));
+  int offset   = (int)(steerValue * basePWM * STEER_DIFFERENTIAL);
+  int leftSpeed  = constrain(basePWM + offset, 0, 255);
+  int rightSpeed = constrain(basePWM - offset, 0, 255);
 
   digitalWrite(STBY, HIGH);
-  if (driveState == FORWARD) {
+  if (forward) {
     digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
     digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
   } else {
@@ -53,19 +70,14 @@ void onWsEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
   if (type != WStype_TEXT) return;
   String msg = String((char*)payload);
 
-  if (msg == "blink") {
-    driveState = FORWARD;
-    driveUntil = millis() + 200;
-    Serial.println("blink → forward");
-  } else if (msg == "clench") {
-    driveState = REVERSE;
-    driveUntil = millis() + 200;
-    Serial.println("clench → reverse");
-  } else if (msg == "stop") {
-    driveState = IDLE;
-    Serial.println("stop");
+  if (msg.startsWith("drive:")) {
+    driveValue = constrain(msg.substring(6).toFloat(), -1.0, 1.0);
+    lastDriveMsg = millis();
   } else if (msg.startsWith("steer:")) {
     steerValue = constrain(msg.substring(6).toFloat(), -1.0, 1.0);
+  } else if (msg == "stop") {
+    driveValue = 0.0;
+    lastDriveMsg = millis();
   }
 }
 
@@ -93,6 +105,5 @@ void setup() {
 
 void loop() {
   ws.loop();
-  if (driveState != IDLE && millis() > driveUntil) driveState = IDLE;
   applyMotors();
 }
