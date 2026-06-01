@@ -13,21 +13,28 @@
 import { GestureDetector, percentile as _p } from './detector'
 import type { Recording, RecordingSegment } from './recorder'
 
+export type ReplaySegment = {
+  label: string
+  note: string | undefined
+  startTs: number
+  durationMs: number
+  originalForward: number
+  originalReverse: number
+  replayedForward: number
+  replayedReverse: number
+  // Trigger timestamps relative to segment start (ms). Used for latency
+  // and inter-trigger-interval metrics in the validation panel.
+  forwardTriggerOffsets: number[]
+  reverseTriggerOffsets: number[]
+  // Tilt scoring (only populated for tilt segments). Steer = accelX - neutral
+  // offset, with the live ±DEAD_ZONE applied. Peak is the signed extreme.
+  tiltPeakSteer?: number
+  tiltEngagedFraction?: number
+  tiltAccelSamples?: number
+}
+
 export type ReplayResult = {
-  segments: Array<{
-    label: string
-    note: string | undefined
-    startTs: number
-    durationMs: number
-    originalForward: number
-    originalReverse: number
-    replayedForward: number
-    replayedReverse: number
-    // Trigger timestamps relative to segment start (ms). Used for latency
-    // and inter-trigger-interval metrics in the validation panel.
-    forwardTriggerOffsets: number[]
-    reverseTriggerOffsets: number[]
-  }>
+  segments: ReplaySegment[]
   totalReplayedForward: number
   totalReplayedReverse: number
   metrics: ReplayMetrics
@@ -61,6 +68,20 @@ export type ReplayMetrics = {
   // segment (only meaningful when a segment produces ≥2 triggers).
   meanFirstTriggerLatencyMs: number | null
   meanInterTriggerIntervalMs: number | null
+  // Tilt (steering) metrics. Steering is continuous, not a discrete trigger, so
+  // it's scored differently from clench/eyebrow: a tilt segment is "engaged" if
+  // its peak |steer| crossed the dead zone (i.e. the head tilt would have
+  // produced a non-zero steer command). neutralOffset is the accel-X zero point
+  // derived from the rest segments. left/right mean steer show that opposite
+  // tilts produce opposite-signed steering; distinct = they engaged in opposite
+  // directions, confirming the steering axis is wired correctly.
+  tiltSegments: number
+  tiltEngagedSegments: number
+  tiltEngagementRate: number
+  tiltNeutralOffset: number | null
+  tiltLeftMeanSteer: number | null
+  tiltRightMeanSteer: number | null
+  tiltDirectionsDistinct: boolean
 }
 
 type ReplayParams = {
@@ -78,17 +99,21 @@ type ReplayParams = {
   forwardHoldMs?: number
   reversePulseMs?: number
   reverseCooldownMs?: number
+  deadZone?: number   // steer dead zone, mirrors live DEAD_ZONE (default 0.1)
+  steerAxis?: 'x' | 'y' | 'z'   // accel axis used for steering, mirrors live STEER_AXIS (default 'y')
 }
 
 export function replayRecording(rec: Recording, params: ReplayParams): ReplayResult {
   const EMA_ALPHA = params.emaAlpha ?? 0.3
-  const CLENCH_MAX_RATIO = params.clenchMaxRatio ?? 1.6
-  const EYEBROW_MIN_RATIO = params.eyebrowMinRatio ?? 1.6
+  const CLENCH_MAX_RATIO = params.clenchMaxRatio ?? 1.3
+  const EYEBROW_MIN_RATIO = params.eyebrowMinRatio ?? 1.3
   const CLENCH_MIN_ZCR = params.clenchMinZcr ?? 0.20
   const FORWARD_DEBOUNCE_TICKS = params.forwardDebounceTicks ?? 3
   const FORWARD_HOLD_MS = params.forwardHoldMs ?? 200
   const REVERSE_COOLDOWN_MS = params.reverseCooldownMs ?? 1500
   const EXPECTED_REPS = params.expectedRepsPerSegment ?? 5
+  const DEAD_ZONE = params.deadZone ?? 0.1
+  const STEER_AXIS = params.steerAxis ?? 'y'
   void params.reversePulseMs  // accepted for parity with live config; unused offline
 
   // Replay only makes sense if a baseline exists in the file.
@@ -100,6 +125,9 @@ export function replayRecording(rec: Recording, params: ReplayParams): ReplayRes
     restSegments: 0, restDurationSec: 0, restFalsePositives: 0,
     falsePositivesPerMinute: 0,
     meanFirstTriggerLatencyMs: null, meanInterTriggerIntervalMs: null,
+    tiltSegments: 0, tiltEngagedSegments: 0, tiltEngagementRate: 0,
+    tiltNeutralOffset: null, tiltLeftMeanSteer: null, tiltRightMeanSteer: null,
+    tiltDirectionsDistinct: false,
   }
 
   if (!baseline) {
@@ -204,18 +232,49 @@ export function replayRecording(rec: Recording, params: ReplayParams): ReplayRes
     }
   }
 
-  const segments = rec.segments.map((s: RecordingSegment, i) => ({
-    label: s.label,
-    note: s.note,
-    startTs: s.startTs,
-    durationMs: s.durationMs,
-    originalForward: s.forwardTriggers,
-    originalReverse: s.reverseTriggers,
-    replayedForward: segTriggers[i].fwd,
-    replayedReverse: segTriggers[i].rev,
-    forwardTriggerOffsets: segTriggers[i].fwdTs.map(t => t - s.startTs),
-    reverseTriggerOffsets: segTriggers[i].revTs.map(t => t - s.startTs),
-  }))
+  // ── Tilt (steering) scoring from accelerometer ────────────────────
+  // Neutral offset mirrors the live calibrateTilt(): the accel-X value at a
+  // centered-head rest. Derive it from the mean accel-X over rest segments
+  // (where the protocol cues "head centered"); fall back to the whole-session
+  // mean if there are no rest samples.
+  const accel = rec.accelSamples ?? []
+  const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length
+  const samplesInRange = (startTs: number, endTs: number) =>
+    accel.filter(a => a.ts >= startTs && a.ts <= endTs)
+  const restXs = rec.segments
+    .filter(s => s.label === 'rest')
+    .flatMap(s => samplesInRange(s.startTs, s.endTs))
+    .map(a => a[STEER_AXIS])
+  const allXs = accel.map(a => a[STEER_AXIS])
+  const neutralOffset: number | null =
+    restXs.length > 0 ? mean(restXs) : (allXs.length > 0 ? mean(allXs) : null)
+
+  const segments: ReplaySegment[] = rec.segments.map((s: RecordingSegment, i): ReplaySegment => {
+    const base = {
+      label: s.label,
+      note: s.note,
+      startTs: s.startTs,
+      durationMs: s.durationMs,
+      originalForward: s.forwardTriggers,
+      originalReverse: s.reverseTriggers,
+      replayedForward: segTriggers[i].fwd,
+      replayedReverse: segTriggers[i].rev,
+      forwardTriggerOffsets: segTriggers[i].fwdTs.map(t => t - s.startTs),
+      reverseTriggerOffsets: segTriggers[i].revTs.map(t => t - s.startTs),
+    }
+    if (s.label !== 'tilt' || neutralOffset === null) return base
+    const steers = samplesInRange(s.startTs, s.endTs).map(a => a[STEER_AXIS] - neutralOffset)
+    if (steers.length === 0) return base
+    let peak = 0
+    for (const v of steers) if (Math.abs(v) > Math.abs(peak)) peak = v
+    const engaged = steers.filter(v => Math.abs(v) >= DEAD_ZONE).length
+    return {
+      ...base,
+      tiltPeakSteer: peak,
+      tiltEngagedFraction: engaged / steers.length,
+      tiltAccelSamples: steers.length,
+    }
+  })
 
   // ── Validation metrics ────────────────────────────────────────────
   const clenchSegs = segments.filter(s => s.label === 'clench')
@@ -253,6 +312,20 @@ export function replayRecording(rec: Recording, params: ReplayParams): ReplayRes
     ? itiMeans.reduce((a, b) => a + b, 0) / itiMeans.length
     : null
 
+  // Tilt aggregates. A tilt segment is "engaged" if its peak steer crossed the
+  // dead zone (steering would have actuated). left/right means use the segment
+  // peak as the representative deflection.
+  const tiltSegs = segments.filter(s => s.label === 'tilt' && s.tiltPeakSteer !== undefined)
+  const tiltEngagedSegs = tiltSegs.filter(s => Math.abs(s.tiltPeakSteer!) >= DEAD_ZONE)
+  const leftPeaks = tiltSegs.filter(s => s.note === 'left').map(s => s.tiltPeakSteer!)
+  const rightPeaks = tiltSegs.filter(s => s.note === 'right').map(s => s.tiltPeakSteer!)
+  const tiltLeftMeanSteer = leftPeaks.length > 0 ? mean(leftPeaks) : null
+  const tiltRightMeanSteer = rightPeaks.length > 0 ? mean(rightPeaks) : null
+  const tiltDirectionsDistinct =
+    tiltLeftMeanSteer !== null && tiltRightMeanSteer !== null &&
+    Math.sign(tiltLeftMeanSteer) !== Math.sign(tiltRightMeanSteer) &&
+    Math.abs(tiltLeftMeanSteer) >= DEAD_ZONE && Math.abs(tiltRightMeanSteer) >= DEAD_ZONE
+
   const metrics: ReplayMetrics = {
     expectedRepsPerSegment: EXPECTED_REPS,
     clenchSegments: clenchSegs.length,
@@ -270,6 +343,13 @@ export function replayRecording(rec: Recording, params: ReplayParams): ReplayRes
       ? (restFalsePositives / restDurationSec) * 60 : 0,
     meanFirstTriggerLatencyMs,
     meanInterTriggerIntervalMs,
+    tiltSegments: tiltSegs.length,
+    tiltEngagedSegments: tiltEngagedSegs.length,
+    tiltEngagementRate: tiltSegs.length > 0 ? tiltEngagedSegs.length / tiltSegs.length : 0,
+    tiltNeutralOffset: neutralOffset,
+    tiltLeftMeanSteer,
+    tiltRightMeanSteer,
+    tiltDirectionsDistinct,
   }
 
   return {

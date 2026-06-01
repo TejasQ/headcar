@@ -26,7 +26,7 @@ Two codebases:
 
 - **Jaw clench → forward** (variable speed by clench intensity). Masseter EMG propagates broadly → detected when *both* AF (forehead) and TP (ear/temple) high-band RMS exceed their thresholds. Intensity is mapped to a drive value in `[0.30, 1.00]`.
 - **Eyebrow raise → reverse** (discrete pulse). Frontalis EMG is local to the forehead → detected when AF high-band fires *while TP stays near baseline*. 800 ms pulse at drive `-0.7`.
-- **Head tilt → steer**. Accelerometer X-axis with dead zone ±0.1.
+- **Head tilt → steer**. Accelerometer **Y-axis** with dead zone ±0.1. (Originally X; empirical validation on 2026-05-29 showed left/right head roll lands on Y for this Muse mounting — X barely moves. See thesis 2026-05-29 (extended). The live axis is the `STEER_AXIS` constant in `laptop/app/page.tsx`.)
 
 Real EEG intent decoding is out of scope.
 
@@ -45,6 +45,39 @@ Work follows the four phases in the README (§ Build phases). Don't skip ahead �
 - Muse 2 channels: AF7, AF8, TP9, TP10 + accel/gyro + PPG.
 - **Web Bluetooth** requires a secure context (HTTPS or localhost). Works on `localhost` in dev and on the Vercel deployment URL, but not on plain HTTP.
 - Web Bluetooth is Chromium-only (Chrome, Edge). Firefox and Safari are not supported.
+
+## Project management (Linear via MCP) — CHECK FIRST, UPDATE ALWAYS
+
+**Linear is the authoritative work queue for this project.** Before suggesting what to work on, before recommending a next step, before assuming a task is "done" — check Linear. The backlog in Linear outranks any TODO in code, any note in chat, and any plan in this file.
+
+Workspace: `headcar` · team: `Headcar` · issue prefix `HEA-`. Work is split across **two Linear projects**, and every issue belongs to one of them:
+
+- **Build path** — hardware → integration → tuning → validation → safety → doc-sync. Everything required to get the Muse-controlled car driving reliably end-to-end.
+- **Presentation path** — slideshow, script, demo rehearsal, and final docs cleanup.
+
+Read both at session start if you haven't this conversation (use `list_projects` then `get_project`). They are the organizing structure over the issues. The old `Headcar` project is deprecated — no live issues should live there; if you find one, move it to the correct path with `save_issue project="Build path"` or `"Presentation path"`.
+
+Wired into Claude Code via the **`linear-server` MCP** (`/mcp` to authenticate if disconnected).
+
+### Mandatory workflow
+
+1. **Check Linear at session start.** Call `list_issues` for at least `assignee=me, state=backlog` and `state=In Progress`. Cross-reference with `project_current_state` memory. Do **not** propose a next step from memory or vibes alone.
+2. **Move issues as work progresses — every time, no exceptions.**
+   - Picking up an issue → `save_issue` with `state: "In Progress"`.
+   - Merged / verified → `state: "Done"`.
+   - Scope changed or abandoned → `state: "Canceled"` with a one-line reason in the description.
+   Stale statuses make the backlog lie, and the user relies on it for thesis pacing.
+   **No active-sprint issue may sit in Backlog.** When a sprint opens, every issue in that sprint's milestone must be at Todo (or further along). Future-sprint issues stay in Backlog — that's how the active board stays focused.
+3. **Reflect repo changes into Linear.** If you tighten thresholds (HEA-21), run a battery test (HEA-17), update wiring docs (HEA-20), etc., immediately move the corresponding issue forward and add a `save_comment` linking the commit / change. Don't wait for the user to ask.
+4. **Branch names = `gitBranchName` field.** Each issue exposes one (e.g. `estephanjonathan/hea-11-connect-car-to-ui-properly`). Use it verbatim so Linear auto-links the PR.
+5. **Creating issues — propose first, file second.** Never create a new issue unilaterally. Suggest it in chat (title + one-line scope + estimate) and wait for explicit approval before calling `save_issue`. Matches the user's "no code without explicit instruction" rule applied to tracked work.
+6. **Search before proposing.** `list_issues` with `query=...` before suggesting anything new — duplicates are noise.
+7. **Use comments for durable context.** Validation results, blockers, decisions → `save_comment` on the relevant issue, not just chat history.
+8. **Markdown content via MCP:** send real newlines, not literal `\n`.
+9. **Estimates: Fibonacci points + T-shirt label.** Every new issue should ship with both. Fibonacci goes in the `estimate` field (1, 2, 3, 5, 8); the matching T-shirt label goes on as a tag so the size is visible on every board view. Mapping: 1=`Size: XS`, 2=`Size: S`, 3=`Size: M`, 5=`Size: L`, 8=`Size: XL`. Apply via `save_issue labels: ["Size: M"]`.
+10. **If the user references an issue by ID** (e.g. "HEA-11"), pull the full issue with `get_issue` and treat that as the source of truth for scope.
+
+Treat Linear hygiene the same way you treat README/thesis hygiene: it is part of the deliverable, not optional bookkeeping.
 
 ## Commands
 

@@ -99,3 +99,11 @@ The dashboard's per-channel meter shows the high-band RMS bar, current ZCR, and 
 ## Hardware
 
 See `SUMMARY.md` for the full parts list, wiring diagram, GPIO pinout, and power architecture.
+
+## Project management
+
+Backlog, in-progress work, and presentation/demo tasks for this project are tracked in **Linear** (workspace `headcar`, team `Headcar`, project `Headcar`, issue prefix `HEA-`). Issues cover both the hardware build path (motor driver wiring, ESP32 integration, motor tests) and the thesis-deliverable path (refinement, slideshow, script, demo rehearsal).
+
+Claude Code is wired to the workspace through the **`linear-server` MCP** — `/mcp` from inside Claude Code to authenticate, then issues can be listed, read, transitioned, and commented on from the editor. Branches use the auto-generated `gitBranchName` field on each issue (e.g. `estephanjonathan/hea-11-connect-car-to-ui-properly`) so Linear auto-links PRs.
+
+Issue creation is gated on explicit approval — Claude proposes new tickets in chat first; nothing is filed without a go-ahead.

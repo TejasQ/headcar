@@ -20,6 +20,38 @@ This project documents the design and build of a brain-controlled RC car using a
 
 ## Journal
 
+### 2026-06-01 — Sprint 1 kickoff, full agile cadence for June (2-week sprints)
+
+Adopted **two-week sprints** for the remainder of the project, Mon–Sun, with every issue assigned to a project milestone in Linear so the cadence is visible at a glance. Demo target locked at 2026-06-30. Three sprint buckets:
+
+| Sprint | Window | Theme | Issues | Points |
+|---|---|---|---|---|
+| 1 | Jun 1 – Jun 14 | Foundation (hardware + bench test + UI integration) | HEA-5, 6, 7, 8, 11 | 12 |
+| 2 (Build) | Jun 15 – Jun 28 | Tuning + validation | HEA-10, 18, 21, 19, 17, 16, 20 | 18 |
+| 2 (Pres) | Jun 15 – Jun 28 | Slides + script + doc polish | HEA-13, 14, 22 | 10 |
+| Demo Week | Jun 29 – Jun 30 | Rehearsal + demo | HEA-15 | 3 |
+
+Sprint 2 runs both lanes in parallel — Build path (18 pts) and Presentation path (10 pts) — because the slides/script can be drafted while the live-drive validation is still being tuned. Total Sprint 2 load = 28 pts, which is heavy but unavoidable given the fixed Jun 30 demo.
+
+**Sprint 1 plan (active as of today):**
+
+- **Goal.** Hardware wired, motors bench-tested, browser dashboard talking to car. End of sprint = drive commands from the UI physically move the wheels.
+- **Committed (12 pts).** HEA-5 (XS, Wed Jun 3) — motor driver on the breadboard. HEA-6 (S, Fri Jun 5) — driver to car motors. HEA-7 (S, Sun Jun 7) — driver to ESP32 GPIO per the README's fixed pinout (PWMA=4, AIN1=5, AIN2=18, PWMB=19, BIN1=15, BIN2=16, STBY=17). HEA-8 (S, Tue Jun 9) — bench-test motors with manual `drive:` commands. HEA-11 (L, Sat Jun 13) — robust simultaneous Muse + car connect from the dashboard.
+- **Definition of done.** Wiring complete + photographed, no shorts on continuity check, manual `drive:`/`steer:` commands from the dashboard move the wheels, simultaneous Muse + car connection works end-to-end without dropping.
+- **Status moves at kickoff.** HEA-5 → In Progress. HEA-6 and HEA-7 → Todo. The rest stay in Backlog until activated mid-sprint — a deliberate rule of the cadence, so the active board only shows what's in flight or queued.
+
+The earlier 1-week breakdown was scrapped — 2 weeks gives the integration work (HEA-11) enough room to breathe without forcing a sprint boundary mid-debug. The obsolete 1-week milestones are tombstoned in Linear (named `(obsolete — see Sprint 1/2 of 2-week cadence)`) since the Linear MCP has no milestone-delete; they'll need to be cleared in the UI.
+
+Why "full agile" rather than a single waterfall plan: with the demo locked at Jun 30 and the project still needing physical assembly + tuning + presentation, sprint boundaries force a checkpoint where slipping (or finishing early) is *visible* rather than buried under a 30-day Gantt. Milestones in Linear take the place of cycles (the MCP can't enable cycles at the team level; that's a UI-only setting), and they're sufficient because every issue carries its sprint, due date, T-shirt size label, and Fibonacci estimate.
+
+### 2026-06-01 — project management migrated to Linear (via MCP)
+
+Switched ad-hoc TODO tracking to **Linear** as the authoritative backlog for the project. Workspace `headcar`, team `Headcar`, project `Headcar`, issue prefix `HEA-`. Eleven issues seeded covering the remaining hardware integration path (motor-driver breadboard, ESP32 wiring, motor bench test, Muse+car simultaneous connect, end-to-end reaction) and the thesis-deliverable path (refinement, slideshow, script, demo rehearsal).
+
+Linear is wired into Claude Code through the **`linear-server` MCP**, so issues can be listed, transitioned, and commented on without leaving the editor. The branch-naming convention is taken directly from each issue's `gitBranchName` field so PRs auto-link. Rule of thumb for the agent: read the Linear backlog at session start, propose new issues for approval rather than filing them silently, and use the `project_current_state` memory as cross-reference. Documented in `CLAUDE.md` and `README.md` so the workflow is reproducible across sessions.
+
+Why this matters for the thesis: until now, the only durable records of "what's left" were memory files and prose notes scattered through this journal. With ~10 days to the demo, a single shared queue replaces three ambiguous ones and forces a hard split between the build deliverable (a working Muse-controlled car) and the presentation deliverable (slideshow + script + rehearsed demo). The current backlog leans hardware-heavy by design — the software pipeline (calibration, EMG discrimination, watchdog, recording/replay, validation metrics) is by this point largely complete; what remains is wiring, integration, and presentation.
+
 ### 2026-05-18
 
 Started wiring the hardware today. The project has gone through a significant number of pivots before reaching this point — originally planned as a custom EEG board build (Cerelog ESP-EEG with ADS1299 chip), then two ESP32s communicating directly, before landing on the current architecture: Muse 2 headband as the sensor, a laptop browser as the BLE host, and a single ESP32 on the car.
@@ -134,6 +166,83 @@ After roughly an evening of using the second-pass system in practice, the user-e
 **Forward intensity calculation:** during a clench, the instantaneous AF high-band RMS is divided by the AF forward threshold to produce a unitless intensity ratio. A value of 1.0 corresponds to just clearing the threshold; the implementation saturates at 3.0 (i.e., three times threshold). This is mapped linearly to a drive value in `[0.30, 1.00]`, with the lower bound chosen empirically as the minimum PWM-equivalent that actually moves the chassis. The mapping ensures (a) a barely-perceptible clench immediately produces motion, (b) maximum effort produces full speed, and (c) the mapping is smooth and monotonic, which is what a user expects from a "press harder" control.
 
 **Thesis-relevant note on the pivot:** this is a case where empirical user-testing dominated the literature-led design. The published EEG-BCI work that informed the second-pass system treats blinks and clenches as canonical artifacts of roughly equal merit. In practical use on this hardware and this user, they are not equivalent at all — clench is straightforwardly the better control modality, and adding variable intensity turns a single-bit signal into a continuous one without any additional sensor capability. The willingness to drop the literature-prescribed gesture in favour of what actually worked is itself a methodological lesson for consumer-BCI projects.
+
+### 2026-05-29 (extended 2) — the eyebrow misses were a ratio-cutoff error, fixed with a data-driven threshold
+
+Two of five eyebrow raises went undetected even at maximum sensitivity (logged in extended-1 as an open thread). Chasing it through the saved recording produced a clean root cause and fix, entirely offline.
+
+**It was never a signal-strength problem.** Per-raise peak analysis at max sensitivity showed all five raises produced strong frontalis signal (peak AF 55–70 μV vs a ~13–20 μV threshold). The discriminator that failed was the **AF/TP ratio gate** (reverse requires `AF/TP > EYEBROW_MIN_AFTP_RATIO`, then 1.6):
+
+| raise | peak AF | TP@peak | max ratio | fired? |
+|---|---|---|---|---|
+| 1 | 58.9 | 38.4 | 1.71 | ✓ |
+| 2 | 69.7 | 42.8 | 1.94 | ✓ |
+| 3 | 55.4 | 36.3 | 1.70 | ✓ |
+| 4 | 55.5 | 43.1 | **1.54** | ✗ |
+| 5 | 68.9 | 44.7 | 1.67 | ✗ |
+
+Raise 4 never reached 1.6; raise 5 brushed it but its brief excursion was swallowed by the forward/clench rule transiently going live on the raise's rising edge (forward fires when ratio < 1.6, which an eyebrow's ~1.5 ratio satisfies). The eyebrow raises co-activate the temporal/auricularis channels enough that the ratio sits at only ~1.5–1.9, not the textbook 2–3 the 1.6 cutoff assumed.
+
+**Confirming the gap before moving the threshold.** Measured the AF/TP ratio across all clench segments in the three clench recordings (736 active ticks): **min 0.21, median 0.32, p99 0.53, max 0.59** — clenches never approach 1.0, let alone 1.6. (This is the TP-primary effect again: masseter EMG lands on TP, so the clench *ratio* is low, ~0.4, not the ~1.0 originally assumed.) So the two classes occupy 0.2–0.6 (clench) and 1.5–1.9 (eyebrow) with a wide empty gap between.
+
+**The fix is a single number, verified by sweep.** A cutoff sweep on the eyebrow recording: 1.6 → 3/5, the plateau **1.1–1.5 → 5/5** (0 FP), 1.0 → 6/5 (over-fires). Chose **1.3** — the centre of both the passing plateau and the empirical gap. Set `CLENCH_MAX_AFTP_RATIO` and `EYEBROW_MIN_AFTP_RATIO` from 1.6 → 1.3 (replayer defaults matched). Re-validated at production defaults:
+
+- Eyebrow **5/5 (100%)**, 0 false positives (was 40–60%).
+- Tilt unchanged: 2/2, directions distinct.
+- Both clench recordings unchanged (10 and 16 forward triggers, **zero** false reverses) — no regression, exactly as the 0.59 ceiling predicted.
+
+**Thesis-relevant lessons.** (a) The original 1.6 cutoff was derived from a *textbook* expectation of the clench/eyebrow ratio regimes (≈1 and ≈2–3); the measured regimes (≈0.4 and ≈1.6) are both shifted down by the same TP-dominant electrode physics this project keeps rediscovering, so a threshold set from the literature was wrong in the same direction twice. Measuring the two distributions and placing the cutoff in the empirical gap is the generalizable method. (b) Two failure modes hid behind one symptom: a hard ratio block (raise 4) and a forward-suppression race (raise 5); lowering the shared cutoff fixed both at once because it also lifts eyebrow ratios clear of the forward rule's ceiling. (c) The entire diagnosis — peak analysis, clench-ratio distribution, cutoff sweep, regression check — was done on saved recordings with zero headset time, which is the payoff of recording raw signal generously.
+
+### 2026-05-29 (extended) — first eyebrow/tilt validation run: a wrong-axis steering bug and an eyebrow sensitivity correction
+
+The eyebrow/tilt tooling built earlier today was exercised on its first real recording (`TestFiles/eyebrow-tilt/headcar-2026-05-29_08-29-06.json`, seven segments: rest baseline, eyebrow ×5, rest, tilt-left ×5, rest, tilt-right ×5, rest; 9533 EEG packets, 1954 accel samples). The run surfaced two distinct problems, one minor (a sensitivity default) and one significant (steering wired to the wrong accelerometer axis). Both were caught by the offline replay — no driving required.
+
+**Eyebrow under-detection.** At the then-default reverse sensitivity of 4.0×, only 2 of 5 raises fired (40%). A sensitivity sweep (replay is parameterized, so this is a no-headset experiment) showed the hit rate plateaus at **3/5 (60%) for any reverse sensitivity ≤ 3.0×**, with **zero false positives at every level down to 2.0×**. Conclusion: 4.0× was needlessly conservative, so the default was lowered to **3.0×** (`DEFAULT_REVERSE_SENSITIVITY`, with the persisted localStorage key bumped `v5`→`v6` so the new default actually takes effect rather than being shadowed by a stored 4.0). The residual issue — two raises that produced *no* detectable trigger even at maximum sensitivity — is not a threshold problem and remains open (likely either too-gentle raises or those raises failing the AF/TP > 1.6 ratio gate; needs a dedicated look).
+
+**The steering axis was wrong.** The tilt scorer reported `directions distinct: false` — left and right tilts both deflected the *same* sign relative to the rest-derived neutral, and the left tilt didn't even cross the dead zone. Dumping the raw per-axis accelerometer means across the tilt segments made the cause obvious:
+
+| axis | rest mean | tilt-left mean | tilt-right mean |
+|---|---|---|---|
+| X (the axis steering used) | 0.096 | 0.113 | 0.080 |
+| **Y** | 0.165 | **−0.100** (min −0.57) | **+0.313** (max +0.90) |
+| Z | 0.995 | 0.947 | 0.901 |
+
+Head roll barely registers on **X** (the originally-specified steering axis) — left and right both sit near the resting value — while **Y** separates the two directions cleanly and opposite-signed. The live system had been steering off X (`accelRef.current.x`) since the 2026-05-20 implementation; on this Muse's head mounting that axis simply doesn't carry the roll signal. This is why qualitative steering had felt unreliable: the control input was mostly noise around a near-constant value.
+
+**Fix.** Steering now reads accel-**Y**, captured in a single `STEER_AXIS = 'y'` constant in `page.tsx` used by both the streaming loop and `calibrateTilt()`; the replayer gained a matching `steerAxis` param (default `'y'`). Re-running the *same* recording through the corrected scorer: **tilt 2/2 segments engaged (100%), directions distinct: true**, left peak −0.712 / right peak +0.750 (cleanly opposite, both ~70% of the segment beyond the dead zone). `CLAUDE.md` was corrected from "X-axis" to "Y-axis."
+
+**Thesis-relevant lessons.** (a) The original "accelerometer X-axis" design note was an *assumption* that survived months unverified because qualitative steering "sort of worked" and no one had a quantitative check; the moment a recorded protocol + per-axis trace existed, the error was unambiguous. This is the strongest argument yet for the validation tooling — it caught a load-bearing bug that hands-on testing had normalised. (b) A convention-free metric (directions-distinct, rather than asserting "left = positive") was exactly what flagged the problem without itself encoding the wrong assumption. (c) Sensitivity sweeps on a saved recording replace a whole category of headset-on retesting: the eyebrow default was retuned with evidence, not guesswork, in seconds.
+
+### 2026-05-29 — eyebrow/tilt guided protocol and accelerometer-based tilt scoring
+
+The validation story so far had a hole: the only guided protocol (`INTENSITY_PROTOCOL`) exercises clenches only, so the single quantitative result (2026-05-28: 100% TP / 0 FP) covers *forward* control and nothing else. Reverse (eyebrow) and steering (tilt) had been implemented and used qualitatively but never put through a recorded, scripted, replay-scored test. This entry closes that gap on the tooling side; the numerical run itself is pending a recording session.
+
+**Second guided protocol.** Added `EYEBROW_TILT_PROTOCOL` alongside the clench one: baseline rest → 5 eyebrow raises → rest → 5 left tilts → rest → 5 right tilts → final rest. Rest/baseline segments carry explicit "head centered" cues because the offline tilt scorer derives its neutral steering point from them. The protocol runner (`startProtocol`/`runProtocolStep`) was parameterized to take a protocol array rather than referencing the clench protocol directly, and the dashboard now offers two launch buttons ("Clench test" and "Eyebrow/Tilt test"). The active protocol is held in both state (for the live banner) and a ref (so the `setTimeout` step-chain reads the current value rather than a stale closure capture — the same closure-staleness class of bug documented in the 2026-05-27 baseline-closure entry).
+
+**Why tilt needed a different metric.** Clench and eyebrow are discrete events scored by trigger count against an expected-reps denominator (hit rate, false-positive rate, latency). Steering is *continuous* — head tilt maps to an accelerometer-X-derived steer value with a ±0.1 dead zone — so "hit rate" is meaningless for it. The replayer had ignored the accelerometer entirely. It now scores tilt segments directly from the recorded `accelSamples`:
+
+- **Neutral offset** = mean accel-X over the rest segments (mirrors the live `calibrateTilt()`, which snapshots accel-X at a centered head). Falls back to the whole-session mean if no rest samples exist.
+- **Per tilt segment:** peak signed steer (the extreme of `accelX − offset`), and engaged-fraction (share of samples beyond the dead zone).
+- **A segment is "engaged"** if its peak crossed the dead zone — i.e. the tilt would have produced a non-zero steer command.
+- **Directions-distinct** check: the left-tilt and right-tilt segments must produce opposite-signed peaks, both past the dead zone. This is the convention-free way to confirm the steering axis is wired correctly without hard-coding which physical tilt yields which sign (that depends on how the Muse sits on the head, which the code shouldn't assume).
+
+The dashboard validation panel gained a "Tilt (steering)" block showing engagement rate, directions-distinct, left/right peak steer, and the neutral offset. The metric is convention-free and reports the offset so the operator can sanity-check the neutral point.
+
+**Verification.** `npm run build` is clean (TypeScript included). The new code was sanity-checked against the existing clench-only recording (`headcar-2026-05-27_15-15-52.json`): clench replay is byte-for-byte unchanged (still 107%), tilt fields default gracefully to zero/empty with no crash, and the neutral offset still computes from the rest accel (0.039). One TypeScript fix was needed along the way — the per-segment map returned a union of "base" and "base + tilt fields", hiding the optional tilt properties; extracting a named `ReplaySegment` type and annotating the map's return type resolved it.
+
+**Thesis-relevant lessons.** (a) Not every control modality is scorable by the same metric — discrete artifact triggers and continuous accelerometer steering need fundamentally different validation, and forcing one framework onto both would have produced a meaningless "tilt hit rate." (b) A direction-*distinctness* test is a more honest validation of a steering axis than asserting a fixed sign convention the hardware mounting could invert. (c) The recorder having captured `accelSamples` all along (even before any tool used them) is why this analysis was possible retroactively — recording raw signals generously, beyond what the current detector consumes, paid off.
+
+### 2026-05-28 — the "clench double-fire" was a misdiagnosis, not a detector bug
+
+The 107% clench hit rate from the 2026-05-27 validation (16 triggers for 15 intended reps, with the single over-count isolated to the medium segment) had been logged as a suspected detector defect — a single sustained clench being split into two forward triggers by a momentary intra-clench dip below threshold. The proposed fix was to widen the forward hold from 200 ms to 500 ms so a brief signal dip inside one clench would not end the forward-live state and re-trigger on recovery.
+
+**The fix was tested before being accepted, and it changed nothing.** Replaying `headcar-2026-05-27_15-15-52.json` at both 200 ms and 500 ms hold produced identical output: 16/15, 107%, zero rest false positives, 1658 ms first-trigger latency, 3712 ms mean inter-trigger interval. A 500 ms hold cannot merge two triggers that are seconds apart, so the null result immediately falsified the intra-clench-dip hypothesis.
+
+**Per-segment forensics located the real cause.** The medium segment contained 6 triggers at offsets 2.0, 5.5, 9.0, 12.9, 16.2, 19.0 s — inter-trigger gaps of 3.5, 3.5, 3.9, 3.4, 2.8 s. Light and hard segments each produced exactly 5, evenly spaced. There is no sub-second gap anywhere in the recording. The "extra" 6th trigger is spaced exactly like a deliberate repetition, sits well inside the 20 s segment window, requires the same ZCR/ratio/threshold gate every other trigger passed, and is accompanied by zero false positives across 29 s of rest. The overwhelmingly likely explanation is that the user performed **six** clenches in the medium block rather than five; the detector counted them faithfully. A spurious detector trigger would manifest as an anomalously short gap or a rest-segment false positive, neither of which is present.
+
+**Outcome.** No detector change is warranted; the speculative `FORWARD_HOLD_MS` change was reverted, leaving the code byte-identical to its prior state. The 107% figure is reclassified from "one detector over-fire" to "one extra intended repetition by the operator (protocol-execution variance)," which strengthens rather than weakens the Chapter-4 result: across 16 genuine clenches the detector achieved a 100% true-positive rate with zero false positives.
+
+**Thesis-relevant lessons.** (a) A headline metric that deviates from the expected value is not self-diagnosing — "107%" was assumed to mean "the detector fired too often" when it actually meant "the operator acted more often than the protocol prescribed." Per-event forensics (the trigger-offset timeline), not the aggregate rate, distinguished the two. (b) Testing a fix against the recorded evidence *before* committing it caught a plausible-but-wrong change; the cost of empirical verification (one replay run) was trivial compared to shipping a hold-window widening that would have degraded detection of legitimate fast repetitions during live driving. (c) The validation/replay tooling built on 2026-05-27 paid for itself the first time a real hypothesis needed checking.
 
 ### 2026-05-27 (extended 5) — first quantitative validation result
 

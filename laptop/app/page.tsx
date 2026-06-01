@@ -10,6 +10,11 @@ import {
 import { replayRecording, ReplayResult } from './replayer'
 
 const DEAD_ZONE = 0.1
+// Steering axis. Despite the original "accelerometer X" design note, empirical
+// validation (thesis 2026-05-29) showed left/right head roll lands on accel-Y
+// for this Muse mounting — X barely moves across tilts while Y separates them
+// cleanly and opposite-signed. Steering reads this axis.
+const STEER_AXIS = 'y' as const
 
 // Detection rule constants.
 const CLENCH_MIN_ZCR = 0.20         // both gestures are EMG — high ZCR required
@@ -18,13 +23,16 @@ const REVERSE_PULSE_MS = 800        // reverse drive duration per eyebrow trigge
 const REVERSE_COOLDOWN_MS = 1500    // prevent chained reverse pulses
 
 // AF/TP RATIO DISCRIMINATOR.
-// Clench: masseter ≈ frontalis in size → AF and TP comparable → ratio ≈ 1.
-// Eyebrow: frontalis ≫ auricularis (the small ear muscle that often co-fires
-// with the eyebrow raise on some users) → AF dominates TP → ratio > ~1.6.
-// Replaces the previous strict TP ceiling, which broke when ear muscles
-// cross-fired during eyebrow raises.
-const CLENCH_MAX_AFTP_RATIO   = 1.6
-const EYEBROW_MIN_AFTP_RATIO  = 1.6
+// Empirically measured on this user/hardware (thesis 2026-05-29 extended-2):
+//   Clench ratio: 0.21–0.59 (TP-dominant — masseter EMG lands on TP9/TP10, not
+//     AF, the same TP-primary effect found on 2026-05-27).
+//   Eyebrow ratio: ~1.5–1.9 (AF-dominant, but the ear/auricularis co-fires
+//     enough to keep TP non-trivial, so the ratio is well below the textbook 2–3).
+// The cutoff was originally 1.6, which clipped the bottom of the eyebrow band and
+// missed ~40% of raises. The two distributions have a wide empty gap (0.6–1.5);
+// 1.3 is its centre and gives a verified 5/5 eyebrow with 0 clench misclassification.
+const CLENCH_MAX_AFTP_RATIO   = 1.3
+const EYEBROW_MIN_AFTP_RATIO  = 1.3
 
 // Guided-test protocol. Scripted sequence of messages and segments with auto
 // timing — the dashboard walks the user through "do light clenches now",
@@ -46,6 +54,26 @@ const INTENSITY_PROTOCOL: ProtocolStep[] = [
   { type: 'message', text: 'Next: 5 HARD clenches.', durationMs: 5000 },
   { type: 'segment', label: 'clench', note: 'hard', instruction: 'HARD clenches × 5 — full effort', durationMs: 20000 },
   { type: 'segment', label: 'rest', note: 'final', instruction: 'Final rest', durationMs: 5000 },
+  { type: 'message', text: 'Done. Click Save .json to download the recording.', durationMs: 3000 },
+]
+
+// Second protocol: exercises eyebrow-raise (reverse) and head-tilt (steer), the
+// two controls the intensity protocol doesn't cover. Tilt segments carry a
+// 'left' / 'right' note as ground-truth intended direction for the replay's
+// tilt-scoring metric. Keep "head centered" cues in rest/baseline segments so
+// the replayer can derive a neutral accel-X offset from the rest mean.
+const EYEBROW_TILT_PROTOCOL: ProtocolStep[] = [
+  { type: 'message', text: 'Get ready — sit comfortably, head centered, hands relaxed. Starting soon…', durationMs: 5000 },
+  { type: 'segment', label: 'rest', note: 'baseline', instruction: 'Sit still, head centered — establishing baseline', durationMs: 10000 },
+  { type: 'message', text: 'Next: 5 EYEBROW raises. Raise hard, hold ~1 s, relax ~3 s between.', durationMs: 5000 },
+  { type: 'segment', label: 'eyebrow', note: 'raises', instruction: 'EYEBROW raises × 5', durationMs: 20000 },
+  { type: 'segment', label: 'rest', note: 'between', instruction: 'Rest — head centered', durationMs: 7000 },
+  { type: 'message', text: 'Next: tilt head LEFT and hold ~2 s, then center. Repeat 5×.', durationMs: 5000 },
+  { type: 'segment', label: 'tilt', note: 'left', instruction: 'Tilt LEFT × 5 — hold, then center', durationMs: 20000 },
+  { type: 'segment', label: 'rest', note: 'between', instruction: 'Rest — head centered', durationMs: 7000 },
+  { type: 'message', text: 'Next: tilt head RIGHT and hold ~2 s, then center. Repeat 5×.', durationMs: 5000 },
+  { type: 'segment', label: 'tilt', note: 'right', instruction: 'Tilt RIGHT × 5 — hold, then center', durationMs: 20000 },
+  { type: 'segment', label: 'rest', note: 'final', instruction: 'Final rest — head centered', durationMs: 5000 },
   { type: 'message', text: 'Done. Click Save .json to download the recording.', durationMs: 3000 },
 ]
 
@@ -72,7 +100,9 @@ const CALIBRATION_PERCENTILE = 0.90
 // Default sensitivities are gesture-specific now (forward and reverse have
 // very different signal scales on this hardware — see thesis 2026-05-27 entry).
 const DEFAULT_FORWARD_SENSITIVITY = 2
-const DEFAULT_REVERSE_SENSITIVITY = 4
+// Lowered from 4 → 3 after the 2026-05-29 eyebrow validation: 4× missed most
+// raises (2/5); 3× recovers one more (3/5) with still zero false positives.
+const DEFAULT_REVERSE_SENSITIVITY = 3
 const SENSITIVITY_MIN = 1.5
 const SENSITIVITY_MAX = 8
 
@@ -98,7 +128,7 @@ export default function Home() {
   })
   const [reverseSensitivity, setReverseSensitivity] = useState(() => {
     if (typeof window === 'undefined') return DEFAULT_REVERSE_SENSITIVITY
-    const v = Number(localStorage.getItem('reverseSensitivity.v5'))
+    const v = Number(localStorage.getItem('reverseSensitivity.v6'))
     return v || DEFAULT_REVERSE_SENSITIVITY
   })
 
@@ -165,6 +195,11 @@ export default function Home() {
   const [protocolRunning, setProtocolRunning] = useState(false)
   const [protocolStepIdx, setProtocolStepIdx] = useState(0)
   const [protocolStepLeft, setProtocolStepLeft] = useState(0)
+  // The protocol currently being run. State drives the live banner; the ref is
+  // read inside the setTimeout step chain (closures would otherwise capture a
+  // stale value).
+  const [activeProtocol, setActiveProtocol] = useState<ProtocolStep[]>(INTENSITY_PROTOCOL)
+  const activeProtocolRef = useRef<ProtocolStep[]>(INTENSITY_PROTOCOL)
   const protocolTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const protocolStepEndsAtRef = useRef(0)
   const [lastSegmentSummary, setLastSegmentSummary] = useState<string | null>(null)
@@ -378,7 +413,7 @@ export default function Home() {
   }
 
   // ── Guided-protocol runner ─────────────────────────────────────────
-  function startProtocol() {
+  function startProtocol(protocol: ProtocolStep[]) {
     if (museStatus !== 'connected' && !simulating) {
       addLog('⚠ guided test needs a connected Muse')
       return
@@ -392,6 +427,8 @@ export default function Home() {
       return
     }
     if (hasUnsavedRecording && !confirmDiscardUnsaved()) return
+    activeProtocolRef.current = protocol
+    setActiveProtocol(protocol)
     startRecording()
     setProtocolRunning(true)
     setProtocolStepIdx(0)
@@ -399,11 +436,12 @@ export default function Home() {
   }
 
   function runProtocolStep(idx: number) {
-    if (idx >= INTENSITY_PROTOCOL.length) {
+    const protocol = activeProtocolRef.current
+    if (idx >= protocol.length) {
       finishProtocol(false)
       return
     }
-    const step = INTENSITY_PROTOCOL[idx]
+    const step = protocol[idx]
     const now = Date.now()
     setProtocolStepIdx(idx)
     protocolStepEndsAtRef.current = now + step.durationMs
@@ -477,7 +515,7 @@ export default function Home() {
   }
 
   function calibrateTilt() {
-    const offset = accelRef.current.x
+    const offset = accelRef.current[STEER_AXIS]
     setAccelOffset(offset)
     accelOffsetRef.current = offset
     addLog(`tilt calibrated — offset ${offset.toFixed(3)}`)
@@ -736,7 +774,7 @@ export default function Home() {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return
       const now = Date.now()
 
-      const raw = accelRef.current.x - accelOffsetRef.current
+      const raw = accelRef.current[STEER_AXIS] - accelOffsetRef.current
       const steer = Math.abs(raw) < DEAD_ZONE ? 0 : raw
       wsRef.current.send(`steer:${steer.toFixed(3)}`)
 
@@ -1030,10 +1068,48 @@ export default function Home() {
                         <span className="float-right font-mono text-gray-200">{ms(m.meanInterTriggerIntervalMs)}</span>
                       </div>
                     </div>
+                    {m.tiltSegments > 0 && (() => {
+                      const steer = (x: number | null) => x === null ? '—' : x.toFixed(3)
+                      return (
+                        <div className="mt-4 pt-3 border-t border-gray-700/60">
+                          <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Tilt (steering)</p>
+                          <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                            <div>
+                              <span className="text-gray-500">Segments engaged</span>
+                              <span className="float-right font-mono">
+                                <span className={m.tiltEngagementRate >= 1 ? 'text-emerald-400' : 'text-blue-300'}>
+                                  {pct(m.tiltEngagementRate)}
+                                </span>
+                                <span className="text-gray-500 ml-2 text-xs">({m.tiltEngagedSegments}/{m.tiltSegments})</span>
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-gray-500">Directions distinct</span>
+                              <span className={`float-right font-mono ${m.tiltDirectionsDistinct ? 'text-emerald-400' : 'text-orange-300'}`}>
+                                {m.tiltDirectionsDistinct ? 'yes' : 'no'}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-gray-500">Left peak steer</span>
+                              <span className="float-right font-mono text-gray-200">{steer(m.tiltLeftMeanSteer)}</span>
+                            </div>
+                            <div>
+                              <span className="text-gray-500">Right peak steer</span>
+                              <span className="float-right font-mono text-gray-200">{steer(m.tiltRightMeanSteer)}</span>
+                            </div>
+                            <div>
+                              <span className="text-gray-500">Neutral offset</span>
+                              <span className="float-right font-mono text-gray-200">{steer(m.tiltNeutralOffset)}</span>
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    })()}
                     <p className="text-xs text-gray-600 mt-3 leading-relaxed">
                       Hit rate = triggers ÷ (segments × expected reps). Can exceed 100% if the detector double-fires per gesture.
                       First-trigger latency = time from segment start to first detection (lower = quicker pickup, but depends on how soon you started the gesture after the segment opened).
                       Inter-trigger interval = average gap between consecutive triggers within a clench segment (close to your intended ~3 s rest between reps = good).
+                      Tilt is scored differently (it's continuous steering, not a discrete trigger): a segment is "engaged" if peak steer crossed the ±0.1 dead zone, and "directions distinct" confirms left and right tilts produced opposite-signed steering.
                     </p>
                   </div>
                 )
@@ -1060,12 +1136,20 @@ export default function Home() {
                   ● Start recording
                 </button>
                 <button
-                  onClick={startProtocol}
+                  onClick={() => startProtocol(INTENSITY_PROTOCOL)}
                   disabled={(museStatus !== 'connected' && !simulating) || (!baseline && !simulating)}
                   className="bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-5 py-2.5 rounded-lg font-medium transition-colors"
                   title={!baseline ? 'Recalibrate first — no baseline' : 'Scripted clench-intensity test (~1m45s)'}
                 >
-                  ▶ Start guided test{!baseline && museStatus === 'connected' ? ' (calibrate first)' : ''}
+                  ▶ Clench test{!baseline && museStatus === 'connected' ? ' (calibrate first)' : ''}
+                </button>
+                <button
+                  onClick={() => startProtocol(EYEBROW_TILT_PROTOCOL)}
+                  disabled={(museStatus !== 'connected' && !simulating) || (!baseline && !simulating)}
+                  className="bg-violet-600 hover:bg-violet-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-5 py-2.5 rounded-lg font-medium transition-colors"
+                  title={!baseline ? 'Recalibrate first — no baseline' : 'Scripted eyebrow + head-tilt test (~1m45s)'}
+                >
+                  ▶ Eyebrow/Tilt test{!baseline && museStatus === 'connected' ? ' (calibrate first)' : ''}
                 </button>
               </>
             ) : protocolRunning ? (
@@ -1114,7 +1198,7 @@ export default function Home() {
 
           {/* Guided-test live banner */}
           {protocolRunning && (() => {
-            const step = INTENSITY_PROTOCOL[protocolStepIdx]
+            const step = activeProtocol[protocolStepIdx]
             const totalSec = Math.ceil(step.durationMs / 1000)
             const pct = Math.max(0, Math.min(100, (1 - protocolStepLeft / totalSec) * 100))
             return (
@@ -1122,7 +1206,7 @@ export default function Home() {
                 <div className="flex items-baseline gap-4 mb-2">
                   <div className="text-3xl font-mono">{protocolStepLeft}s</div>
                   <div className="text-xs text-indigo-300 uppercase tracking-widest">
-                    Step {protocolStepIdx + 1} of {INTENSITY_PROTOCOL.length}
+                    Step {protocolStepIdx + 1} of {activeProtocol.length}
                     {step.type === 'segment' && (
                       <span className="ml-2 px-1.5 py-0.5 rounded bg-indigo-700/60 text-indigo-100 normal-case tracking-normal">
                         {step.label}{step.note ? ` · ${step.note}` : ''}
@@ -1324,7 +1408,7 @@ export default function Home() {
               onChange={e => {
                 const v = Number(e.target.value)
                 setReverseSensitivity(v)
-                localStorage.setItem('reverseSensitivity.v5', String(v))
+                localStorage.setItem('reverseSensitivity.v6', String(v))
               }}
               className="w-full accent-red-500"
             />
