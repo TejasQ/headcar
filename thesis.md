@@ -4,21 +4,203 @@
 
 Artifact-Based Brain-Computer Interfaces for Consumer Robotics: Building a Head-Controlled RC Car with Off-the-Shelf EEG Hardware
 
-## Research question
+## Aim and objectives
 
-Can consumer-grade EEG hardware (Muse 2) provide reliable, low-latency control signals for a mobile robotic platform using non-cognitive artifacts (blinks, jaw clenches, head tilt) rather than decoded neural intent?
+### General objective
 
-## Hypothesis
+To design, implement, and empirically validate a real-time brain–computer-interface (BCI) control system that enables a user wearing a consumer-grade EEG headband (Muse 2) to drive a ground vehicle using non-cognitive electrophysiological and mechanical artifacts — jaw clench, eyebrow raise, and head tilt — without machine-learning-based decoding of conscious neural intent, and to characterise the reliability, latency, and limitations of such artifact-based control on commodity hardware.
 
-Artifact-based signals from a consumer EEG headband are sufficient for real-time, directional control of a ground vehicle, and require no machine learning — only threshold detection on known signal morphologies.
+### Specific objectives
 
-## Abstract (draft, revised 2026-05-26)
+- **SO1 — Acquisition.** Establish a reliable browser-hosted signal-acquisition path from the Muse 2 (Web Bluetooth + `muse-js`) delivering the four EEG channels (AF7, AF8, TP9, TP10) plus the on-board accelerometer at full rate.
+- **SO2 — Feature extraction.** Decompose each channel into physiologically meaningful frequency bands (EOG-band ≤10 Hz, EMG-band ≥20 Hz) and derive low-latency features (band-power RMS, zero-crossing rate) over a sliding window.
+- **SO3 — Discrimination.** Devise a non-ML decision rule that reliably separates two overlapping facial-EMG gestures (jaw clench vs eyebrow raise) whose signals propagate across multiple electrodes.
+- **SO4 — Adaptive calibration.** Implement a per-session, noise-floor-based calibration that makes detection robust to inter- and intra-session signal drift, replacing fixed absolute thresholds.
+- **SO5 — Actuation and safety.** Transmit control commands wirelessly to an ESP32-driven vehicle over a continuous WebSocket protocol governed by a fail-safe watchdog.
+- **SO6 — Continuous control.** Extract intensity-graded (proportional) speed control from a single artifact, demonstrating richer-than-binary command capability.
+- **SO7 — Validation.** Quantitatively evaluate per-gesture hit rate, false-positive rate, and detection latency from labelled recordings, with appropriate statistical treatment of small-sample proportions.
+- **SO8 — Critical appraisal.** Assess the system's accessibility, novelty, and divergence from research-grade EOG/EMG literature, and the implications for reproducibility.
 
-This project documents the design and build of a brain-controlled RC car using a Muse 2 consumer EEG headband and an ESP32 microcontroller. Rather than attempting to decode conscious neural intent — a problem unsolved even in research-grade BCI — the system leverages reliable electrophysiological and mechanical artifacts: jaw clench (masseter EMG burst across all four EEG channels) for forward motion with continuous speed control proportional to clench intensity, eyebrow raise (frontalis EMG localized to AF7/AF8) for discrete reverse pulses, and head tilt (accelerometer X-axis) for differential steering. Detection runs entirely on raw `eegReadings` from `muse-js`, using a two-band Butterworth biquad decomposition, sliding-window RMS, zero-crossing rate, and a session-specific noise-floor calibration derived from the 90th percentile of baseline measurements. Commands are transmitted from a browser-based dashboard over WebSocket to the car, which is governed by a 500 ms drive-watchdog as a safety mechanism. The project explores the gap between the popular perception of "mind control" and what consumer EEG can actually deliver, and argues that artifact-based control with adaptive thresholds is not a compromise but a pragmatic and reproducible approach to accessible BCI.
+### Research questions
+
+- **RQ1.** To what extent can non-cognitive artifacts captured by a four-channel consumer EEG headband serve as reliable control commands for a ground vehicle?
+  - *Evidence to date:* offline validation at production defaults gives clench 16/16 hits (hit rate 1.00) with 0 false positives over 29 s of rest, eyebrow 5/5, and steering directions distinct in 2/2 trials — establishing reliability at the **detection** level. The full **live closed-loop** claim awaits the HEA-8 motor bench test (replacement ESP32 validated and comms proven 2026-06-08; motor wiring pending a soldering iron), so end-to-end driving is not yet demonstrated.
+- **RQ2.** Which artifacts (jaw clench, eyebrow raise, head tilt, blink) yield the most reliable and discriminable control signals on consumer-grade hardware?
+  - *Evidence to date:* on this user/hardware the reliability ordering is **clench > head tilt > eyebrow ≫ blink**. Clench validates at 100% hit / 0 FP and supports intensity grading; head tilt is high-reliability and continuous; eyebrow is usable but needed a higher sensitivity (3×) and a ratio fix to reach 5/5; blink was trialled and **removed** because AF-contact limitations made it unreliable (2026-05-26 pivot). This is a direct, data-backed answer.
+- **RQ3.** How can two facial-EMG gestures whose signals overlap across electrodes be discriminated without machine learning?
+  - *Evidence to date:* the AF/TP band-power **ratio discriminant** `r = AF/max(TP,1)` separates the two cleanly — measured clench `r ∈ [0.2, 0.6]` vs eyebrow `r ∈ [1.5, 1.9]`, split at `r* = 1.3`. It exploits a biological invariant (masseter ≈ frontalis ≫ auricularis) rather than a trained model, and replaced an earlier AND-NOT rule. After adopting it, eyebrow detection reached 5/5 with 0 cross-firing. Strongly evidenced.
+- **RQ4.** What accuracy-versus-latency trade-off does the signal-processing pipeline (filtering, windowing, feature extraction) impose, and which configuration best balances the two?
+  - *Evidence to date:* the chosen configuration — 250 ms (64-sample) RMS window, 2nd-order Butterworth bands, EMA `α = 0.3` (~150 ms), and a 3-tick (150 ms) forward debounce — was selected as a time-frequency compromise: long enough to estimate band power stably, short enough to keep detection delay ~125 ms median. The qualitative trade-off is documented (larger windows / higher-order filters → sharper bands but more group delay); a formal parameter sweep quantifying accuracy vs latency across settings is still to be run.
+- **RQ5.** To what extent does per-session, noise-floor-based adaptive calibration improve robustness against signal drift relative to fixed thresholds, and does the user-tuned sensitivity parameter transfer across sessions?
+  - *Evidence to date:* fixed μV thresholds were observed to misfire across days and within minutes (headset fit, skin chemistry), motivating the move to `θ = σ·P₉₀(baseline)` with a 5 s noise-floor capture. Qualitatively, the **unitless sensitivity `σ` transfers** across sessions (defaults forward 2×, reverse 3× held over multiple sessions) while the absolute threshold is re-derived each time. A quantitative drift study over a 30-minute session (Chapter 4.2) is still pending.
+- **RQ6.** What end-to-end latency from user intent to motor actuation is measured in practice, and is it sufficient for real-time closed-loop driving?
+  - *Evidence to date:* a component **latency budget** is estimated — BLE Muse→browser ~10–20 ms, detection-window delay ~125 ms median, drive-stream interval 100 ms — totalling a **target < 400 ms**. This is an estimate, not yet a measurement: the empirical intent-to-motor figure requires the live drive loop (HEA-8) and is the outstanding item for this RQ.
+- **RQ7.** What are the dominant sources of false positives and false negatives per gesture, and how can they be mitigated?
+  - *Evidence to date:* identified FP sources — forward: speech, swallowing, neck tension; reverse: forehead expressions, surprise reactions. Mitigations in place: the ratio discriminator (anti cross-fire), a ZCR > 0.20 gate (rejects slow drift), forward debounce, and a reverse pulse+cooldown. Validation recorded **0 false positives over 29 s of rest**; however that rest was quiet, so the speech/swallow FP rates are characterised qualitatively and not yet quantified under active interference.
+- **RQ8.** To what extent can continuous, intensity-graded speed control be derived from the amplitude of a single artifact?
+  - *Evidence to date:* the pipeline maps clench intensity to a continuous drive value in `[0.30, 1.00]` and onward to motor PWM (`MIN_PWM + |d|·(MAX_PWM−MIN_PWM)`), and intensity-protocol recordings reproduce graded triggering across light/medium/hard clenches. A formal monotonicity measure — correlating clench amplitude against commanded speed across the recorded sessions — is still to be computed and is the direct test of H2.
+- **RQ9.** How does empirically tuned consumer-EEG artifact detection diverge from research-grade EOG/EMG literature, and what does this imply for reproducibility?
+  - *Evidence to date:* three documented divergences from the textbook account, each forced by real testing on this user/hardware: (1) clench is detected **TP-primary** (temporal channels), contradicting the "AF is the EMG/forehead channel" simplification; (2) head-roll steering lands on the accelerometer **Y-axis, not X**, for this mounting; (3) reverse needed 3× (not 4×) sensitivity and a ratio cutoff of 1.3, set from measured distributions. Together these argue that consumer-EEG detection must be **empirically retuned per mounting/user**, with implications for replicability discussed in Chapter 5.
+- **RQ10.** How does artifact-based control compare to conventional neural-intent decoding as a training-free and accessible interaction paradigm?
+  - *Evidence to date (argumentative):* the system requires no model training and only a ~5 s per-session calibration, and runs entirely in a commodity Chromium browser on consumer hardware — supporting the training-free and accessibility claims. Unlike neural-intent decoders, no labelled training corpus or per-user model is needed. The comparison is developed qualitatively in Chapter 5 rather than from a head-to-head empirical benchmark, which is out of scope for a single-subject build.
+
+### Hypotheses
+
+- **H1 (primary).** Non-cognitive artifacts from a consumer EEG headband, processed with band-power thresholding and a ratio-based discriminator over an adaptive noise-floor calibration, are sufficient for reliable real-time directional control of a ground vehicle — operationalised as a per-gesture hit rate ≥ 90% with a false-positive rate ≤ 5% during rest — without any machine learning.
+- **H2 (secondary).** The amplitude of jaw-clench EMG carries sufficient information to support continuous, proportional speed control, such that a single gesture yields a monotonic, user-controllable mapping from clench intensity to vehicle speed rather than a binary on/off command.
+
+## Conceptual statistical and mathematical model
+
+The system is formalised as a real-time, threshold-based classification pipeline operating on band-power features, parameterised by a per-session adaptive calibration, and evaluated with small-sample proportion statistics. The model has five stages.
+
+**1. Signal model.** For each electrode `c ∈ {AF7, AF8, TP9, TP10}`, the Muse streams a discrete raw signal `x_c[n]` at sample rate `Fs = 256 Hz`. Each channel is split into two band-limited components by second-order Butterworth biquads:
+
+- low band `y_c^L[n]` (cutoff 10 Hz) — captures EOG / blink energy;
+- high band `y_c^H[n]` (cutoff 20 Hz) — captures facial-EMG energy.
+
+**2. Feature extraction.** Over a sliding window of `N = 64` samples (250 ms), per band `B ∈ {L, H}`:
+
+```
+RMS_c^B = sqrt( (1/N) · Σ_{k=1..N} ( y_c^B[k] )² )          (band-power)
+ZCR_c   = (1/N) · #{ k : sign(y_c^H[k]) ≠ sign(y_c^H[k-1]) }  (zero-crossing rate)
+```
+
+Channel groups are pooled into forehead and temporal EMG means, then EMA-smoothed (`s_t = α·x_t + (1−α)·s_{t−1}`, `α = 0.3`):
+
+```
+AF = mean( RMS_AF7^H , RMS_AF8^H )
+TP = mean( RMS_TP9^H , RMS_TP10^H )
+```
+
+**3. Adaptive threshold.** From a 5 s resting baseline `B_c` collected at calibration, the decision threshold is the 90th percentile of the baseline scaled by a unitless user sensitivity `σ`:
+
+```
+θ_c = σ · P₉₀( B_c )
+```
+
+The 90th percentile (rather than the mean) provides robustness to transient twitches during calibration; `σ` is the single tunable parameter exposed to the user and transfers across sessions while the absolute threshold is re-derived each session.
+
+**4. Decision rule (classifier).** Detection uses a ratio discriminant `r = AF / max(TP, 1)` that exploits anatomical asymmetry (masseter ≈ frontalis ≫ auricularis), making it invariant to absolute signal magnitude. The piecewise rule is:
+
+```
+Forward (jaw clench):  TP > θ_TP  AND  r < r*  AND  max_c ZCR_c > 0.20      [3-tick debounce]
+Reverse (eyebrow):     AF > θ_AF  AND  r > r*  AND  max_c ZCR_c > 0.20      [800 ms pulse, 1500 ms cooldown]
+```
+
+with split point `r* = 1.3` (the empirical gap centre: measured clench `r ∈ [0.2, 0.6]`, eyebrow `r ∈ [1.5, 1.9]`). Forward suppresses reverse on co-trigger. Steering is taken from the accelerometer Y-axis with a dead zone of ±0.1.
+
+**5. Continuous drive mapping.** Clench intensity is normalised to `I = clamp( (TP − θ_TP) / (TP_max − θ_TP), 0, 1 )` and mapped to a drive value, then to motor PWM:
+
+```
+d   = d_min + I · (d_max − d_min),   d ∈ [0.30, 1.00]
+PWM = MIN_PWM + |d| · (MAX_PWM − MIN_PWM),   MIN_PWM = 120, MAX_PWM = 255
+```
+
+establishing the monotonic intensity→speed relationship that H2 predicts.
+
+**6. Evaluation statistics.** Each gesture is treated as a binary classification problem against labelled ground-truth segments (`1`/`2`/`3` markers in the recorder). From the confusion counts (TP, FP, FN):
+
+```
+Hit rate (recall/sensitivity) = TP / (TP + FN)
+Precision                     = TP / (TP + FP)
+False-positive rate           = FP per unit rest-time
+```
+
+Because per-session sample sizes are small, point estimates are reported with **Wilson score 95% confidence intervals** rather than naïve normal-approximation bounds, and differences between sensitivity settings (e.g. reverse `σ = 3×` vs `4×`) are compared with **Fisher's exact test**. Detection latency is summarised by its median and inter-quartile range. Optionally, detection probability is modelled as a logistic function of the feature-to-threshold margin `m = (feature − θ)/θ`, `P(detect | m) = 1 / (1 + exp(−k(m − m₀)))`, giving a principled basis for choosing `σ`. The first logged validation instantiates this model: clench 16/16 hits (hit rate 1.00) with 0 false positives over 29 s of rest, eyebrow 5/5, and steering directions distinct in 2/2 trials — the full Chapter-4 dataset is being accumulated across recorded sessions.
+
+## Innovation and novelty
+
+- **Proportional control from a single artifact.** Most artifact-based BCIs issue binary commands (blink → click). Deriving a continuous, monotonic speed signal from jaw-clench *intensity* is the system's primary novel contribution and the subject of H2.
+- **Magnitude-invariant, ML-free discriminator.** The AF/TP ratio separates two overlapping EMG gestures using a biologically invariant anatomical asymmetry rather than per-user trained models — robust to headset fit, skin conductance, and day-to-day drift.
+- **Fully browser-native pipeline.** The entire acquisition-to-command stack runs in a Chromium browser (Web Bluetooth + `muse-js`) with no native application and no cloud relay — a deliberately reproducible, low-barrier architecture.
+- **Per-session percentile calibration** as a first-class component, making commodity-hardware detection stable without electrode gel or laboratory conditions.
+- **Empirically-driven divergence from literature.** Detection was retuned to the *temporal* electrodes for clench on this mounting (TP-primary), contradicting the textbook "AF is the EMG channel" simplification — a documented, data-backed reproducibility finding.
+
+## Thesis document structure
+
+Mapping the supervisor's four-part Bachelor-Thesis layout onto this project (cross-referenced to the detailed chapter notes later in this document):
+
+1. **Design** — system architecture and the end-to-end signal chain (Muse 2 → Web Bluetooth → detector → WebSocket → ESP32 → TB6612FNG → motors); hardware selection and the block diagram. *(See Chapter 2.)*
+2. **Analysis of the design** — the electrophysiological and anatomical rationale, the design trade-offs (discrete vs continuous control, fixed vs adaptive thresholds, ratio vs absolute discrimination), and the latency budget. *(See Chapters 1, 2, 5.)*
+3. **Software algorithm** — the detection pipeline (`laptop/app/detector.ts`), the gesture decision rules, the adaptive calibration, and the ESP32 firmware (`car/car.ino`). *(See Chapter 3 and the Statistical/Mathematical Model above.)*
+4. **Logic structure** — control flow and state: the acquisition→feature→decision→command loop, the calibration state machine, the safety watchdog, and the data-flow between laptop and car. *(See Chapter 3.)*
+
+## Referencing
+
+Bibliographic management is standardised on **Mendeley** (per supervisor guidance). The running list under *References* at the end of this document is the working source set; entries are to be imported into a Mendeley library and cited in the SRH Bachelor-Thesis citation style throughout the final Word document.
+
+## Abstract (draft, revised 2026-06-09)
+
+This project documents the design and build of a brain-controlled RC car using a Muse 2 consumer EEG headband and an ESP32 microcontroller. Rather than attempting to decode conscious neural intent — a problem unsolved even in research-grade BCI — the system leverages reliable electrophysiological and mechanical artifacts: jaw clench (masseter EMG, detected primarily on the temporal channels TP9/TP10) for forward motion with continuous speed control proportional to clench intensity, eyebrow raise (frontalis EMG localized to AF7/AF8) for discrete reverse pulses, and head tilt (accelerometer Y-axis) for differential steering. Detection runs entirely on raw `eegReadings` from `muse-js`, using a two-band Butterworth biquad decomposition, sliding-window RMS, zero-crossing rate, and a session-specific noise-floor calibration derived from the 90th percentile of baseline measurements. Commands are transmitted from a browser-based dashboard over WebSocket to the car, which is governed by a 500 ms drive-watchdog as a safety mechanism. The project explores the gap between the popular perception of "mind control" and what consumer EEG can actually deliver, and argues that artifact-based control with adaptive thresholds is not a compromise but a pragmatic and reproducible approach to accessible BCI.
 
 ---
 
 ## Journal
+
+### 2026-06-09 — Supervisor feedback: academic-framework restructure of the thesis front matter
+
+Met (async, via Teams chat notes) with the supervisor, Het Mehta (SRH Hochschule Berlin), who set out the academic-structure expectations for the Bachelor Thesis ahead of a progress review in ~two weeks. Captured requirements:
+
+- **Mendeley** for reference management.
+- **Word document layout** organised as: (1) Design, (2) Analysis of the design, (3) Software algorithm, (4) Logic structure.
+- **Objectives** split into a **General Objective** and **Specific Objectives**.
+- **10 Research Questions** (previously a single research question).
+- **2 Hypotheses** (previously one).
+- A **statistical / mathematical model** explicitly relating to the project.
+- General emphasis on **academic language, format, structure, innovation, and novelty**.
+
+**Actions taken in this document.** Replaced the single research question and single hypothesis at the top with a formal research framework: a general objective, eight specific objectives (SO1–SO8), ten research questions (RQ1–RQ10), and two hypotheses (H1 primary — reliability ≥90% hit / ≤5% FP; H2 secondary — proportional speed control from clench intensity). Added a *Conceptual statistical and mathematical model* section formalising the existing pipeline — signal model, band-power/ZCR feature extraction, the adaptive percentile threshold `θ_c = σ·P₉₀(B_c)`, the ratio discriminant `r = AF/max(TP,1)` as a piecewise classifier, the intensity→PWM drive mapping, and an evaluation-statistics framework (confusion-matrix metrics, Wilson score intervals for small-sample proportions, Fisher's exact test for sensitivity-setting comparisons, and an optional logistic detection-probability model). Added *Innovation and novelty* and *Thesis document structure* (mapping the supervisor's four-part layout to the existing chapter notes), plus a *Referencing* note standardising on Mendeley.
+
+Nothing in the existing journal, glossary, chapter notes, or references was removed — the restructure is purely additive front matter so the development history remains intact. Next: pull the *References* list into a Mendeley library and begin drafting the Word document against the four-part layout. The maths model is deliberately framed so the Chapter-4 validation numbers slot directly into it as they accumulate.
+
+**Refinement (same day).** The ten RQs were then tightened: yes/no items (RQ1, RQ8, RQ10) reworded to graded "To what extent / How" form; the two latency questions split cleanly (RQ4 = accuracy-vs-latency *design* trade-off, RQ6 = *measured* end-to-end latency); and cross-session transferability of the sensitivity parameter folded into RQ5. Each RQ then received an honest *"Evidence to date"* annotation distinguishing what is already demonstrated (e.g. RQ2/RQ3/RQ9 — strongly evidenced from logged validation) from what remains pending (RQ1 live closed-loop drive, RQ6 measured latency, RQ8 amplitude-vs-speed monotonicity, RQ4 parameter sweep, RQ5 30-min drift study, RQ7 FP rates under active interference). This gives the progress review a clear demonstrated-vs-pending split.
+
+### 2026-06-08 — Replacement ESP32 validated; comms path proven end-to-end (HEA-8 partially unblocked)
+
+The replacement ESP32 (AZ-Delivery NodeMCU, CP2102) arrived and was brought up under the staged safety procedure defined in the 2026-06-02 post-mortem. The board passed cleanly and the full wireless control path is now confirmed — the only remaining gate on HEA-8 is the physical motor wiring.
+
+**Stage 1 — bare board on USB-C alone (no buck, no driver, no rail).** The board enumerated on COM6 and, critically, **stayed cool across both faces** through flashing and runtime — the exact opposite of the dead board, which cooked instantly. `car.ino` flashed without issue. Serial Monitor @115200 reported:
+
+```
+IP: 172.20.10.2
+mDNS started → car.local
+WebSocket server ready on port 81
+```
+
+So WiFi association (2.4 GHz, iPhone hotspot), mDNS responder, and the port-81 WebSocket server all come up correctly on the new hardware.
+
+**Stage 1.5 — comms-only handshake (still USB, motors absent).** With the laptop joined to the same hotspot, `npm run dev` + the dashboard's *Connect car* produced a `client connected` event on the ESP32's serial log. This validates the complete `dashboard → ws:// → ESP32` path in isolation, with the motor driver deliberately disconnected so nothing can actuate. The laptop↔car link is therefore proven independent of any power or motor concerns — a useful decomposition, since it means any later motor-test failure can be attributed to the power/driver stage, not comms.
+
+**Stage 2 — deferred (hardware blocker).** Bringing the board up on buck power and wiring the TB6612 surfaced wiring problems that need soldered joints rather than improvised breadboard connections (improvised solder was implicated in the 2026-06-01 over-voltage chain that killed the first board). A soldering iron has been ordered and arrives **2026-06-09**; the buck-power measurement (5 V *at the ESP32 5V pin under load*) and the motor drive test resume then.
+
+**Status.** New board confirmed fully healthy; wireless command path confirmed end-to-end. HEA-8 remains In Progress, now blocked only on the soldering iron / motor wiring rather than on a dead board. The earlier hard blocker (failed AMS1117) is resolved.
+
+### 2026-06-02 — ESP32 destroyed by failed 3.3 V regulator (HEA-8 blocked)
+
+The motor bench test (HEA-8) was halted by a hardware failure: the ESP32 overheated as soon as it was powered, and a continuity check confirmed the board is dead.
+
+**Sequence of events.** Before testing, the wire from the buck converter's OUT+ to the ESP32 5V pin had physically broken off and was re-soldered/improvised. To de-risk the repair, the buck output was measured *isolated* (ESP32 disconnected, cells in): a clean **4.91 V**, correct polarity — exactly the trimmed 5 V target set on 2026-06-01. The wiring topology was independently re-verified against the prior day's validated layout: OUT+ runs through a single dedicated breadboard row to the ESP32 5V pin only — not the 3V3 pin, not the positive (7.4 V) rail. Despite a correct rail and a correct connection, the moment the board was powered from the cells (no USB attached), it grew hot across both faces, including the WROOM module's RF shield.
+
+**Diagnosis (continuity test, board de-powered).** Resistance/continuity between three pin pairs:
+
+| Pair | Reading | Interpretation |
+|---|---|---|
+| 5V ↔ GND | ~1570 Ω | normal (bulk capacitance / regulator path) |
+| **3V3 ↔ GND** | **continuity beep (~0 Ω)** | **dead short — failure** |
+| 5V ↔ 3V3 | ~550 Ω | regulator path, plausible |
+
+A near-zero short from the 3.3 V rail to ground is the signature of a **failed-shorted on-board 3.3 V regulator (AMS1117)**. With the rail shorted, any supply current dumps into the short → the regulator (bottom) and the SoC (top) both heat immediately, and the board can never boot.
+
+**Root cause.** The board was almost certainly killed on 2026-06-01 by an over-voltage event (the MP1584 ships defaulting to ~12 V; before it was trimmed to 5 V it briefly fed the ESP32 VIN). Today's overheating was not a *new* fault but the consequence of re-powering an already-shorted board. The 4.91 V measurement was not misleading — the buck was healthy; the damage lay downstream, in the regulator, and would not show at the buck's OUT+ terminal under no load.
+
+**What this confirms (and what it doesn't).** The wiring is *correct*: every signal pin matches the firmware constants, the grounds are common, and OUT+ is correctly isolated to the 5V pin. This is a dead component, not a design or wiring fault — a fresh ESP32 in the same harness should work.
+
+**Process change adopted for the replacement bring-up** (to ensure one wiring slip can't claim two boards):
+1. Power a new ESP32 from **USB-C alone first** (buck disconnected) — confirm it boots/flashes and stays cool.
+2. Only then, board de-powered, attach the buck — and this time measure 5 V **at the ESP32 5V pin under load**, not merely at the buck's OUT+ terminal.
+3. Never have USB and the buck powering the board simultaneously.
+
+**Status.** HEA-8 blocked pending a replacement ESP32. The diagnostic narrative and the bring-up checklist are the durable takeaways — a textbook example of why bench bring-up sequences exist.
 
 ### 2026-06-01 — Sprint 1 kickoff, full agile cadence for June (2-week sprints)
 
