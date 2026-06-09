@@ -11,6 +11,20 @@ Two codebases live here:
 
 The README is the source of truth for decisions, architecture, and the build plan; read it before suggesting changes.
 
+## Code-learning mode (Jonathan is learning to read code)
+
+Jonathan is using this repo to **get better at reading and understanding code**. When he asks for explanations, follow this:
+
+- **Style:** plain English, short, small digestible chunks he can commit to memory. Avoid jargon; when a term is unavoidable (float, class, server, PWM, WebSocket), define it in one line with an everyday analogy. He has already had: float vs int, class vs function, server vs client, WebSocket. Build on those, don't re-explain unless asked.
+- **Two files already carry study-guide comments** (comments only, no logic changed; currently uncommitted in the working tree):
+  - `car/car.ino` — top-of-file overview, the setup()/loop() model, pins, state globals, and every function annotated.
+  - `laptop/app/detector.ts` — Biquad as a "frequency sieve" black box, the bands, RingBuffer/RMS/ZCR, and the per-electrode GestureDetector.
+- **Recommended reading order** (smallest/most concrete first): `car/car.ino` → `laptop/app/detector.ts` → `laptop/app/recorder.ts` → `laptop/app/replayer.ts` → `laptop/app/page.tsx` (1500 lines, save for last; navigate by searching for known names).
+- **The anchor exercise:** trace `drive:0.5` from the laptop → `onWsEvent` (saves `driveValue`) → `loop()` → `applyMotors()` → motor PWM. That one path explains the whole firmware.
+- **Teaching method that works for him:** outside-in (start from an observed behavior, find the code), trace one path fully rather than skim, and have *him* explain a function back in his own words for confirmation.
+- **Not yet annotated** (offer when he's ready): `recorder.ts`, `replayer.ts`, `page.tsx`.
+- He reads code in **Cursor** (installed); open with `cursor "<repo path>" "<file>"`.
+
 ## Architecture
 
 ```
