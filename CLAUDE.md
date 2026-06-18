@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Two codebases live here:
 
 - `laptop/` — Next.js app (the browser-based dashboard). Muse BLE connect, gesture detection, accel display, simulate mode, WebSocket client to car. Adaptive calibration + contact-quality indicators.
-- `car/` — ESP32 Arduino sketch. WiFi, mDNS (`car.local`), WebSocket server on port 81, motor control via TB6612FNG with PWM speed scaling and a 500 ms watchdog.
+- `car/` — ESP32 Arduino sketch. WiFi, mDNS (`car.local`), WebSocket server on port 81, motor control via **L298N** (swapped from the TB6612FNG on 2026-06-15 after four TB6612 modules proved counterfeit with a dead high-side — see thesis 2026-06-15 / SUMMARY Phase 2) with PWM speed scaling and a 500 ms watchdog.
 
 The README is the source of truth for decisions, architecture, and the build plan; read it before suggesting changes.
 
@@ -38,8 +38,8 @@ Two codebases:
 
 "Brain control" in practice means Muse-detectable artifacts, mapped to driving controls:
 
-- **Jaw clench → forward** (variable speed by clench intensity). Masseter EMG propagates broadly → detected when *both* AF (forehead) and TP (ear/temple) high-band RMS exceed their thresholds. Intensity is mapped to a drive value in `[0.30, 1.00]`.
-- **Eyebrow raise → reverse** (discrete pulse). Frontalis EMG is local to the forehead → detected when AF high-band fires *while TP stays near baseline*. 800 ms pulse at drive `-0.7`.
+- **Jaw clench → forward** (variable speed by clench intensity). On this hardware masseter EMG lands almost entirely on TP9/TP10 (ear/temple), not the forehead → detected as **TP-primary**: `tpHigh` over its threshold with the AF/TP ratio in the clench zone (`< 0.6`). Intensity is mapped to a drive value in `[0.30, 1.00]`.
+- **Eyebrow raise → reverse** (held while raised, not a discrete pulse). Frontalis EMG is local to the forehead → detected when AF high-band fires with the AF/TP ratio in the eyebrow zone (`> 1.0`). Reverse holds at drive `-0.7` while the raise is sustained (250 ms grace window).
 - **Head tilt → steer**. Accelerometer **Y-axis** with dead zone ±0.1. (Originally X; empirical validation on 2026-05-29 showed left/right head roll lands on Y for this Muse mounting — X barely moves. See thesis 2026-05-29 (extended). The live axis is the `STEER_AXIS` constant in `laptop/app/page.tsx`.)
 
 Real EEG intent decoding is out of scope.
@@ -54,8 +54,9 @@ Work follows the four phases in the README (§ Build phases). Don't skip ahead �
 
 - **ESP32 is 2.4 GHz WiFi only.** WiFi creds are hardcoded in the sketch.
 - Use **mDNS (`car.local`)** rather than hardcoded IP — router IP changes.
-- **GPIO pinout to TB6612** is fixed in README (PWMA=4, AIN1=5, AIN2=18, PWMB=19, BIN1=15, BIN2=16, STBY=17). Use these. GPIO 6 and 7 are flash pins on ESP32 — unusable.
-- Direction truth table: A=on/B=off → forward; A=off/B=on → reverse; both off → coast; both on → brake.
+- **GPIO pinout** is fixed (GPIO 4/5/18/19/15/16). The firmware names are unchanged from the TB6612 build (PWMA=4, AIN1=5, AIN2=18, PWMB=19, BIN1=15, BIN2=16, STBY=17) but now wire to the **L298N**: PWMA→ENA, AIN1→IN1, AIN2→IN2, PWMB→ENB, BIN1→IN3, BIN2→IN4; **STBY (17) is unused** (L298N has no standby). GPIO 6 and 7 are flash pins on ESP32 — unusable. Full wiring + as-built wire colours in SUMMARY.md.
+- Direction truth table (L298N, per channel): IN1=H/IN2=L → forward; IN1=L/IN2=H → reverse; both L → coast; both H → brake. ENA/ENB PWM duty = speed.
+- L298N caps: 5V-enable ON (self-powers logic from +12V — no ESP32-3.3V-to-driver wire needed); ENA/ENB caps OFF (GPIO PWM controls speed). Motors on OUT1/OUT2 (left=A), OUT3/OUT4 (right=B).
 - Muse 2 channels: AF7, AF8, TP9, TP10 + accel/gyro + PPG.
 - **Web Bluetooth** requires a secure context (HTTPS or localhost). Works on `localhost` in dev and on the Vercel deployment URL, but not on plain HTTP.
 - Web Bluetooth is Chromium-only (Chrome, Edge). Firefox and Safari are not supported.
