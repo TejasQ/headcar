@@ -10,6 +10,12 @@ import {
 import { replayRecording, ReplayResult } from './replayer'
 
 const DEAD_ZONE = 0.1
+// Steering: amplify head tilt → steer (raw accel tilt is small; scale it up past the
+// dead zone toward ±1). Slider-tunable live (HEA-18); DEFAULT bumped 3.0 → 5.0 for
+// more sensitivity out of the box.
+const DEFAULT_STEER_GAIN = 4.0   // finalized 2026-06-17 on the live car (HEA-18)
+const STEER_GAIN_MIN = 1.0
+const STEER_GAIN_MAX = 12.0
 // Steering axis. Despite the original "accelerometer X" design note, empirical
 // validation (thesis 2026-05-29) showed left/right head roll lands on accel-Y
 // for this Muse mounting — X barely moves across tilts while Y separates them
@@ -19,8 +25,11 @@ const STEER_AXIS = 'y' as const
 // Detection rule constants.
 const CLENCH_MIN_ZCR = 0.20         // both gestures are EMG — high ZCR required
 const FORWARD_HOLD_MS = 200         // grace period after rule stops being satisfied
-const REVERSE_PULSE_MS = 800        // reverse drive duration per eyebrow trigger
-const REVERSE_COOLDOWN_MS = 1500    // prevent chained reverse pulses
+const REVERSE_PULSE_MS = 800        // reverse duration for a one-shot/simulated trigger
+const REVERSE_HOLD_MS = 250         // grace while the eyebrow is held: reverse stays on as
+                                    // long as the rule keeps firing, with no burst/cooldown gap
+const MANUAL_HOLD_MS = 2500         // manual Forward/Reverse button drive duration
+const ENDURANCE_DRIVE = 0.6         // steady "typical load" for the HEA-17 battery-drain test
 
 // AF/TP RATIO DISCRIMINATOR.
 // Empirically measured on this user/hardware (thesis 2026-05-29 extended-2):
@@ -29,10 +38,15 @@ const REVERSE_COOLDOWN_MS = 1500    // prevent chained reverse pulses
 //   Eyebrow ratio: ~1.5–1.9 (AF-dominant, but the ear/auricularis co-fires
 //     enough to keep TP non-trivial, so the ratio is well below the textbook 2–3).
 // The cutoff was originally 1.6, which clipped the bottom of the eyebrow band and
-// missed ~40% of raises. The two distributions have a wide empty gap (0.6–1.5);
-// 1.3 is its centre and gives a verified 5/5 eyebrow with 0 clench misclassification.
-const CLENCH_MAX_AFTP_RATIO   = 1.3
-const EYEBROW_MIN_AFTP_RATIO  = 1.3
+// missed ~40% of raises.
+// Re-measured 2026-06-15 (HEA-21, final headset fit, all 4 dots green): eyebrow
+// ~1.2, clench ~0.43. Replaced the single 0.8 cutoff with a DEAD BAND for clearer
+// separation: forward needs ratio < 0.6 (clearly TP-dominant), reverse needs
+// ratio > 1.0 (clearly AF-dominant); 0.6–1.0 is no-man's-land where neither fires,
+// so a clench and an eyebrow raise can't bleed into each other. The gate reads the
+// extra-smoothed ratio, and each gesture is debounced + mutually exclusive.
+const CLENCH_MAX_AFTP_RATIO   = 0.6   // forward: ratio must be BELOW this (TP-dominant)
+const EYEBROW_MIN_AFTP_RATIO  = 1.0   // reverse: ratio must be ABOVE this (AF-dominant)
 
 // Guided-test protocol. Scripted sequence of messages and segments with auto
 // timing — the dashboard walks the user through "do light clenches now",
@@ -84,13 +98,19 @@ const EYEBROW_TILT_PROTOCOL: ProtocolStep[] = [
 //        (rule eval is throttled to 20 Hz) before going active — prevents a
 //        single noisy tick from firing a forward burst.
 const EMA_ALPHA = 0.3
-const FORWARD_DEBOUNCE_TICKS = 3    // 3 × 50 ms = 150 ms sustained signal required
+const RATIO_EMA_ALPHA = 0.2         // extra smoothing for the displayed AF/TP ratio (HEA-21)
+const FORWARD_DEBOUNCE_TICKS = 5    // 5 × 50 ms = 250 ms sustained signal required (raised
+                                    // from 3 — HEA-21: brief noise spikes no longer trip forward)
+const REVERSE_DEBOUNCE_TICKS = 3    // eyebrow must hold ~150 ms before reverse engages —
+                                    // rejects brief AF spikes (reverse is held, not pulsed)
 
-// Speed mapping. Forward intensity is afMean / afThr_fwd, where 1.0 = at threshold,
-// ~3.0 = saturation. We map [1.0, 3.0] → [MIN_FWD, MAX_FWD] for the drive value.
+// Speed mapping. Forward intensity is tpHigh / tpThrFwd, where 1.0 = at threshold,
+// 2.0 = saturation. We map [1.0, 2.0] → [MIN_FWD, MAX_FWD] for the drive value.
+// Saturation lowered 3.0 → 2.0 (HEA-21): at 3.0 you needed ~6× baseline TP to hit
+// full speed (unreachable), so speed felt flat. 2.0 ramps over a real clench range.
 const MIN_FORWARD = 0.30  // minimum drive when barely clenching (overcome motor stiction)
 const MAX_FORWARD = 1.00
-const INTENSITY_SATURATION = 3.0   // afMean / afThr at which we hit MAX_FORWARD
+const INTENSITY_SATURATION = 2.0   // tpHigh / tpThrFwd at which we hit MAX_FORWARD
 const REVERSE_SPEED = 0.7
 
 // Calibration window.
@@ -99,11 +119,15 @@ const CALIBRATION_PERCENTILE = 0.90
 
 // Default sensitivities are gesture-specific now (forward and reverse have
 // very different signal scales on this hardware — see thesis 2026-05-27 entry).
-const DEFAULT_FORWARD_SENSITIVITY = 2
+// Forward lowered 2 → 1.2 (HEA-21, 2026-06-15): at 2× a comfortable clench only
+// reached 62% of the threshold (never triggered); 1.2× makes a comfortable clench
+// the start-of-motion point. localStorage key bumped to .v7 so a stale slider value
+// from before this retune is ignored on next load.
+const DEFAULT_FORWARD_SENSITIVITY = 1.2
 // Lowered from 4 → 3 after the 2026-05-29 eyebrow validation: 4× missed most
 // raises (2/5); 3× recovers one more (3/5) with still zero false positives.
 const DEFAULT_REVERSE_SENSITIVITY = 3
-const SENSITIVITY_MIN = 1.5
+const SENSITIVITY_MIN = 1.0
 const SENSITIVITY_MAX = 8
 
 type Baseline = { afHigh: number; tpHigh: number }
@@ -118,18 +142,26 @@ export default function Home() {
   const [reverseActive, setReverseActive] = useState(false)
   const [accel, setAccel] = useState({ x: 0, y: 0, z: 0 })
   const [simulating, setSimulating] = useState(false)
+  const [armed, setArmed] = useState(false)   // "listening": when false the car ignores the Muse
+  const [enduranceOn, setEnduranceOn] = useState(false)  // HEA-17 endurance / battery-drain test running
+  const [enduranceElapsed, setEnduranceElapsed] = useState(0)  // seconds (live while running, frozen at cutoff)
   const [log, setLog] = useState<string[]>([])
   const [accelOffset, setAccelOffset] = useState(0)
 
   const [forwardSensitivity, setForwardSensitivity] = useState(() => {
     if (typeof window === 'undefined') return DEFAULT_FORWARD_SENSITIVITY
-    const v = Number(localStorage.getItem('forwardSensitivity.v5'))
+    const v = Number(localStorage.getItem('forwardSensitivity.v7'))
     return v || DEFAULT_FORWARD_SENSITIVITY
   })
   const [reverseSensitivity, setReverseSensitivity] = useState(() => {
     if (typeof window === 'undefined') return DEFAULT_REVERSE_SENSITIVITY
     const v = Number(localStorage.getItem('reverseSensitivity.v6'))
     return v || DEFAULT_REVERSE_SENSITIVITY
+  })
+  const [steerGain, setSteerGain] = useState(() => {
+    if (typeof window === 'undefined') return DEFAULT_STEER_GAIN
+    const v = Number(localStorage.getItem('steerGain.v1'))
+    return v || DEFAULT_STEER_GAIN
   })
 
   const [baseline, setBaseline] = useState<Baseline | null>(null)
@@ -144,7 +176,7 @@ export default function Home() {
   ])
   // Live EMA-smoothed group means, surfaced from refs so Forward/Reverse cards
   // can show a "live preview" bar even before a trigger fires.
-  const [liveSignal, setLiveSignal] = useState({ afEma: 0, tpEma: 0 })
+  const [liveSignal, setLiveSignal] = useState({ afEma: 0, tpEma: 0, ratio: 0 })
 
   // Replay state. Loaded file + most recent replay result.
   const [replayResult, setReplayResult] = useState<ReplayResult | null>(null)
@@ -153,6 +185,7 @@ export default function Home() {
   const [contacts, setContacts] = useState<ContactQuality[]>(['bad', 'bad', 'bad', 'bad'])
 
   const wsRef = useRef<WebSocket | null>(null)
+  const museClientRef = useRef<MuseClient | null>(null)
   const simTimers = useRef<ReturnType<typeof setInterval>[]>([])
   const accelRef = useRef({ x: 0, y: 0, z: 0 })
   const accelOffsetRef = useRef(0)
@@ -166,6 +199,7 @@ export default function Home() {
   // EMA-smoothed feature values, updated each meter tick.
   const afSmoothedRef = useRef(0)
   const tpSmoothedRef = useRef(0)
+  const ratioSmoothedRef = useRef(0)
 
   // Consecutive-tick counter for the forward debounce. Counts ticks where the
   // forward rule conditions hold; resets to 0 the moment a tick fails. Forward
@@ -219,7 +253,10 @@ export default function Home() {
   const forwardActiveUntilRef = useRef(0)
   const forwardSpeedRef = useRef(0)
   const reverseUntilRef = useRef(0)
-  const lastReverseRef = useRef(0)
+  const reverseOffTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const reverseConsecutiveRef = useRef(0)
+  const armedRef = useRef(false)
+  const steerGainRef = useRef(DEFAULT_STEER_GAIN)
   const drivingFlagRef = useRef(false)
 
   const detectorRef = useRef(new GestureDetector())
@@ -497,16 +534,96 @@ export default function Home() {
     addLog('recording discarded')
   }
 
+  const manualTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const manualStopRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Endurance / battery-drain test (HEA-17): its own resend interval + an
+  // active-flag the streaming loop checks so Muse control yields while it runs.
+  const enduranceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const enduranceOnRef = useRef(false)
+  const enduranceStartRef = useRef(0)                                          // ms timestamp the test started
+  const enduranceTickRef = useRef<ReturnType<typeof setInterval> | null>(null) // 1 Hz on-screen timer
+
   function sendRaw(cmd: string) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(cmd)
     }
   }
 
+  // Cancel any in-flight manual-drive hold (its resend interval + auto-stop timer).
+  function clearManualHold() {
+    if (manualTimerRef.current) { clearInterval(manualTimerRef.current); manualTimerRef.current = null }
+    if (manualStopRef.current) { clearTimeout(manualStopRef.current); manualStopRef.current = null }
+  }
+
+  // Manual button drive. The car's 500 ms watchdog stops a single command almost
+  // immediately, so to get a clearly visible ~MANUAL_HOLD_MS of motion we resend
+  // the value every 200 ms (before the watchdog expires), then send drive:0.
+  // value 0 = immediate stop, and cancels any active hold.
   function manualDrive(value: number, label: string) {
+    clearManualHold()
+    if (value === 0) {
+      sendRaw('drive:0')
+      addLog(`→ drive:0 (${label})`)
+      recordEvent('manual_drive', { value, label })
+      return
+    }
     sendRaw(`drive:${value.toFixed(2)}`)
-    addLog(`→ drive:${value.toFixed(2)} (${label})`)
+    manualTimerRef.current = setInterval(() => sendRaw(`drive:${value.toFixed(2)}`), 200)
+    manualStopRef.current = setTimeout(() => {
+      clearManualHold()
+      sendRaw('drive:0')
+    }, MANUAL_HOLD_MS)
+    addLog(`→ drive:${value.toFixed(2)} (${label}, ${(MANUAL_HOLD_MS / 1000).toFixed(1)}s hold)`)
     recordEvent('manual_drive', { value, label })
+  }
+
+  // Endurance / battery-drain test (HEA-17). Drives a steady "typical load" value,
+  // resending every 200 ms to beat the car's 500 ms watchdog, with NO auto-stop —
+  // it runs until you stop it OR the car drops off the network (battery cutoff).
+  // An on-screen timer counts up the whole time and freezes at the final runtime;
+  // the value is logged and saved into any active recording, so nothing needs
+  // noting by hand. Disarms Muse control and the streaming loop yields to it so
+  // nothing fights the steady command.
+  function finishEndurance(reason: 'manual' | 'cutoff') {
+    if (enduranceTimerRef.current) { clearInterval(enduranceTimerRef.current); enduranceTimerRef.current = null }
+    if (enduranceTickRef.current) { clearInterval(enduranceTickRef.current); enduranceTickRef.current = null }
+    if (!enduranceOnRef.current) return
+    enduranceOnRef.current = false
+    const seconds = Math.round((Date.now() - enduranceStartRef.current) / 1000)
+    setEnduranceElapsed(seconds)    // freeze the on-screen timer at the final runtime
+    setEnduranceOn(false)
+    sendRaw('drive:0')              // harmless no-op if the link already dropped
+    const mmss = `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`
+    addLog(reason === 'cutoff'
+      ? `■ car lost power (battery cutoff) after ${mmss}`
+      : `■ endurance test stopped at ${mmss}`)
+    recordEvent('endurance_test', { state: reason, seconds })
+  }
+
+  function toggleEndurance() {
+    if (enduranceOnRef.current) { finishEndurance('manual'); return }
+    clearManualHold()
+    setArmed(false)                 // gate off Muse-driven control during the test
+    drivingFlagRef.current = false  // suppress the loop's transition drive:0
+    enduranceOnRef.current = true
+    enduranceStartRef.current = Date.now()
+    setEnduranceElapsed(0)
+    setEnduranceOn(true)
+    sendRaw(`drive:${ENDURANCE_DRIVE.toFixed(2)}`)
+    // Resend to beat the watchdog; if the socket has dropped, the car lost power
+    // → that's the cutoff, so finalize and freeze the timer.
+    enduranceTimerRef.current = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(`drive:${ENDURANCE_DRIVE.toFixed(2)}`)
+      } else {
+        finishEndurance('cutoff')
+      }
+    }, 200)
+    enduranceTickRef.current = setInterval(() => {
+      setEnduranceElapsed(Math.round((Date.now() - enduranceStartRef.current) / 1000))
+    }, 1000)
+    addLog(`▶ endurance test started (drive ${ENDURANCE_DRIVE}) — timing until cutoff`)
+    recordEvent('endurance_test', { state: 'start', value: ENDURANCE_DRIVE })
   }
 
   function updateAccel(val: { x: number; y: number; z: number }) {
@@ -555,16 +672,22 @@ export default function Home() {
     }, CALIBRATION_MS)
   }
 
-  function triggerReverse() {
+  // Held reverse: called every tick the eyebrow rule is satisfied. Each call extends
+  // the reverse window by holdMs, so a sustained eyebrow raise = continuous reverse
+  // (no 800 ms pulse + cooldown bursting). The off-timer is re-armed every call and
+  // only fires holdMs after the LAST call — i.e. once the eyebrow drops.
+  function triggerReverse(holdMs = REVERSE_HOLD_MS) {
     const now = Date.now()
-    if (now - lastReverseRef.current < REVERSE_COOLDOWN_MS) return
-    lastReverseRef.current = now
-    reverseUntilRef.current = now + REVERSE_PULSE_MS
-    setReverseActive(true)
-    setTimeout(() => setReverseActive(false), REVERSE_PULSE_MS)
-    addLog('eyebrow → reverse')
-    reverseTriggerCountRef.current++
-    recordEvent('reverse_trigger')
+    const wasLive = now < reverseUntilRef.current
+    reverseUntilRef.current = now + holdMs
+    if (!wasLive) {                       // rising edge = a new reverse session
+      setReverseActive(true)
+      addLog('eyebrow → reverse')
+      reverseTriggerCountRef.current++
+      recordEvent('reverse_trigger')
+    }
+    if (reverseOffTimerRef.current) clearTimeout(reverseOffTimerRef.current)
+    reverseOffTimerRef.current = setTimeout(() => setReverseActive(false), holdMs)
   }
 
   function connectCar() {
@@ -577,11 +700,24 @@ export default function Home() {
     ws.onerror = () => setCarStatus('error')
   }
 
+  // Closing the socket fires ws.onclose above, which sets the status + logs.
+  function disconnectCar() {
+    wsRef.current?.close()
+  }
+
+  async function disconnectMuse() {
+    try { await museClientRef.current?.disconnect() } catch { /* already gone */ }
+    museClientRef.current = null
+    setMuseStatus('idle')
+    addLog('muse disconnected')
+  }
+
   async function connectMuse() {
     setMuseStatus('connecting')
     setMuseError(null)
     try {
       const client = new MuseClient()
+      museClientRef.current = client
       await client.connect()
       await client.start()
       setMuseStatus('connected')
@@ -651,18 +787,26 @@ export default function Home() {
 
           // AF/TP ratio — guard div-by-zero against a flatline TP signal.
           const ratio = afHigh / Math.max(tpHigh, 1)
+          // Extra-smoothed copy used for BOTH the UI readout AND the gate decisions —
+          // the raw ratio is jumpy, and smoothing it stops forward/reverse from
+          // flickering into each other near the boundary.
+          ratioSmoothedRef.current = RATIO_EMA_ALPHA * ratio + (1 - RATIO_EMA_ALPHA) * ratioSmoothedRef.current
+          const ratioStable = ratioSmoothedRef.current
 
-          // FORWARD (jaw clench): TP-primary rule. On this user/hardware, the
-          // masseter EMG lands almost entirely on TP9/TP10 with AF7/AF8 barely
-          // moving — the textbook "masseter propagates broadly to AF too" model
-          // doesn't fit consumer-EEG electrode placement. See thesis entry
-          // 2026-05-27 for the empirical data. Ratio < 1.6 still discriminates
-          // clench (TP-dominant) from eyebrow (AF-dominant). Requires
-          // FORWARD_DEBOUNCE_TICKS sustained ticks before going active.
+          // Mutual exclusion: whichever gesture is currently live locks out the other
+          // until it releases, so a clench and an eyebrow raise can't bleed across.
+          const reverseLive = now < reverseUntilRef.current
+
+          // FORWARD (jaw clench): TP-primary. On this user/hardware the masseter EMG
+          // lands almost entirely on TP9/TP10 with AF7/AF8 barely moving (thesis
+          // 2026-05-27). Requires a clearly TP-dominant ratio (< CLENCH_MAX_AFTP_RATIO),
+          // TP above threshold, and FORWARD_DEBOUNCE_TICKS sustained ticks. Blocked
+          // while reverse is live.
           const forwardRuleNow =
+            !reverseLive &&
             emgPresent &&
             tpHigh > tpThrFwdRef.current &&
-            ratio < CLENCH_MAX_AFTP_RATIO
+            ratioStable < CLENCH_MAX_AFTP_RATIO
           if (forwardRuleNow) {
             forwardConsecutiveRef.current++
             if (forwardConsecutiveRef.current >= FORWARD_DEBOUNCE_TICKS) {
@@ -675,18 +819,23 @@ export default function Home() {
             forwardConsecutiveRef.current = 0
           }
 
-          // REVERSE (eyebrow raise): AF elevated AND AF dominates TP (ratio high).
-          // Auricularis EMG can co-fire with frontalis on some users, lighting up
-          // TP a bit — but never as much as masseter would, so the ratio check
-          // still discriminates. Discrete trigger; suppressed while forward live.
+          // REVERSE (eyebrow raise): AF elevated AND clearly AF-dominant
+          // (ratio > EYEBROW_MIN_AFTP_RATIO). Held gesture, debounced like forward so a
+          // brief AF spike can't trip it. forwardLive is read AFTER the forward block so
+          // a clench that just fired this tick wins the tie.
           const forwardLive = now < forwardActiveUntilRef.current
-          if (
+          const reverseRuleNow =
             !forwardLive &&
             emgPresent &&
             afHigh > afThrRevRef.current &&
-            ratio > EYEBROW_MIN_AFTP_RATIO
-          ) {
-            triggerReverse()
+            ratioStable > EYEBROW_MIN_AFTP_RATIO
+          if (reverseRuleNow) {
+            reverseConsecutiveRef.current++
+            if (reverseConsecutiveRef.current >= REVERSE_DEBOUNCE_TICKS) {
+              triggerReverse()
+            }
+          } else {
+            reverseConsecutiveRef.current = 0
           }
         }
 
@@ -694,7 +843,7 @@ export default function Home() {
         const fwdLive = now < forwardActiveUntilRef.current
         setForwardActive(fwdLive)
         setForwardSpeed(fwdLive ? forwardSpeedRef.current : 0)
-        setLiveSignal({ afEma: afSmoothedRef.current, tpEma: tpSmoothedRef.current })
+        setLiveSignal({ afEma: afSmoothedRef.current, tpEma: tpSmoothedRef.current, ratio: ratioSmoothedRef.current })
 
         // Edge-trigger event logging for the recording.
         if (fwdLive && !forwardWasActiveRef.current) {
@@ -738,7 +887,7 @@ export default function Home() {
         forwardSpeedRef.current = intensity
         forwardActiveUntilRef.current = Date.now() + 1500
       }, 4000),
-      setInterval(() => triggerReverse(), 9000),
+      setInterval(() => triggerReverse(REVERSE_PULSE_MS), 9000),
       setInterval(() => {
         const t = (Date.now() - start) / 1000
         updateAccel({
@@ -760,6 +909,8 @@ export default function Home() {
     setSimulating(false)
     forwardActiveUntilRef.current = 0
     reverseUntilRef.current = 0
+    if (reverseOffTimerRef.current) clearTimeout(reverseOffTimerRef.current)
+    setReverseActive(false)
     setForwardActive(false)
     setForwardSpeed(0)
     addLog('simulate stopped')
@@ -768,14 +919,29 @@ export default function Home() {
   // Streaming loop: send steer always, drive only when gesture-active.
   // When transitioning out of any drive state, send drive:0 once so the car
   // stops immediately instead of waiting on the watchdog.
+  useEffect(() => { armedRef.current = armed }, [armed])
+  useEffect(() => { steerGainRef.current = steerGain }, [steerGain])
   useEffect(() => {
     if (carStatus !== 'connected') return
     const id = setInterval(() => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return
+      // HEA-17 endurance test drives on its own steady interval — yield the whole
+      // Muse/steer loop to it so the two don't fight over `drive:`.
+      if (enduranceOnRef.current) return
       const now = Date.now()
 
+      // "Listening" gate: while disarmed the car ignores ALL Muse-driven control
+      // (steer + gesture drive). Manual buttons still work; the Muse stays connected.
+      if (!armedRef.current) {
+        if (drivingFlagRef.current) { wsRef.current.send('drive:0'); drivingFlagRef.current = false }
+        return
+      }
+
       const raw = accelRef.current[STEER_AXIS] - accelOffsetRef.current
-      const steer = Math.abs(raw) < DEAD_ZONE ? 0 : raw
+      // Subtract the dead zone, then apply the (slider-tunable) steering gain and clamp
+      // to [-1, 1]. The gain makes a modest head tilt reach a strong steer command.
+      const past = Math.abs(raw) < DEAD_ZONE ? 0 : raw - Math.sign(raw) * DEAD_ZONE
+      const steer = Math.max(-1, Math.min(1, past * steerGainRef.current))
       wsRef.current.send(`steer:${steer.toFixed(3)}`)
 
       const reverseLive = now < reverseUntilRef.current
@@ -800,6 +966,11 @@ export default function Home() {
 
   useEffect(() => () => {
     simTimers.current.forEach(clearInterval)
+    if (manualTimerRef.current) clearInterval(manualTimerRef.current)
+    if (manualStopRef.current) clearTimeout(manualStopRef.current)
+    if (enduranceTimerRef.current) clearInterval(enduranceTimerRef.current)
+    if (enduranceTickRef.current) clearInterval(enduranceTickRef.current)
+    if (reverseOffTimerRef.current) clearTimeout(reverseOffTimerRef.current)
     if (calibrationCountdown.current) clearInterval(calibrationCountdown.current)
     if (protocolTimer.current) clearTimeout(protocolTimer.current)
     wsRef.current?.close()
@@ -847,12 +1018,13 @@ export default function Home() {
   const afThrRev = baseline ? baseline.afHigh * reverseSensitivity : 0
 
   // Live AF/TP ratio for the dashboard — useful for diagnosing whether the
-  // discriminator can tell clench from eyebrow. Computed from the meters state
-  // (which is updated every 50 ms) rather than the EMA refs, so React re-renders
-  // pick it up; the value is close enough to the smoothed signal for diagnosis.
-  const afLive = (meters[1].highRms + meters[2].highRms) / 2
-  const tpLive = (meters[0].highRms + meters[3].highRms) / 2
-  const liveRatio = afLive / Math.max(tpLive, 1)
+  // discriminator can tell clench from eyebrow. Uses the extra-smoothed ratio
+  // (ratioSmoothedRef, mirrored into liveSignal) so the readout isn't jumpy.
+  const liveRatio = liveSignal.ratio
+  // Steering command preview (mirrors the drive-loop math) for the Head Tilt card.
+  const steerIn = accel[STEER_AXIS] - accelOffset
+  const steerOut = Math.abs(steerIn) < DEAD_ZONE ? 0
+    : Math.max(-1, Math.min(1, (steerIn - Math.sign(steerIn) * DEAD_ZONE) * steerGain))
 
   return (
     <main className="min-h-screen bg-gray-900 text-white p-8">
@@ -879,6 +1051,14 @@ export default function Home() {
         >
           {museLabel}
         </button>
+        {museStatus === 'connected' && (
+          <button
+            onClick={disconnectMuse}
+            className="bg-gray-700 hover:bg-gray-600 px-4 py-3 rounded-lg font-medium transition-colors"
+          >
+            Disconnect Muse
+          </button>
+        )}
 
         <button
           onClick={startCalibration}
@@ -904,7 +1084,26 @@ export default function Home() {
           >
             {carLabel}
           </button>
+          {carStatus === 'connected' && (
+            <button
+              onClick={disconnectCar}
+              className="bg-gray-700 hover:bg-gray-600 px-4 py-3 rounded-lg font-medium transition-colors"
+            >
+              Disconnect
+            </button>
+          )}
         </div>
+
+        {carStatus === 'connected' && (
+          <button
+            onClick={() => setArmed(a => { const next = !a; if (!next) sendRaw('drive:0'); return next })}
+            className={armed
+              ? 'bg-green-600 hover:bg-green-500 px-6 py-3 rounded-lg font-bold transition-colors'
+              : 'bg-amber-600 hover:bg-amber-500 px-6 py-3 rounded-lg font-bold transition-colors'}
+          >
+            {armed ? '● Listening — STOP' : '▶ Start listening'}
+          </button>
+        )}
 
         <button
           onClick={simulating ? stopSimulate : startSimulate}
@@ -919,7 +1118,7 @@ export default function Home() {
       </div>
 
       <div className="max-w-3xl mb-8">
-        <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Manual control (one-shot, ~500 ms via car watchdog)</p>
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Manual control (~2.5 s hold, then auto-stop)</p>
         <div className="flex gap-3">
           <button
             onClick={() => manualDrive(0.7, 'manual forward')}
@@ -942,6 +1141,29 @@ export default function Home() {
           >
             Stop
           </button>
+        </div>
+      </div>
+
+      <div className="max-w-3xl mb-8">
+        <p className="text-xs text-gray-500 uppercase tracking-widest mb-2">Endurance test (HEA-17 battery drain — drives {ENDURANCE_DRIVE} until cutoff)</p>
+        <div className="flex items-center gap-4">
+          <button
+            onClick={toggleEndurance}
+            disabled={!carConnected}
+            className={enduranceOn
+              ? 'bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-bold transition-colors'
+              : 'bg-violet-700 hover:bg-violet-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-bold transition-colors'}
+          >
+            {enduranceOn ? '■ Stop endurance test' : `▶ Run endlessly (drive ${ENDURANCE_DRIVE})`}
+          </button>
+          {(enduranceOn || enduranceElapsed > 0) && (
+            <div className="flex items-baseline gap-2">
+              <span className={`font-mono text-3xl tabular-nums ${enduranceOn ? 'text-violet-300' : 'text-gray-300'}`}>
+                {Math.floor(enduranceElapsed / 60)}:{String(enduranceElapsed % 60).padStart(2, '0')}
+              </span>
+              <span className="text-xs text-gray-500">{enduranceOn ? 'elapsed' : 'runtime to cutoff'}</span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1109,7 +1331,7 @@ export default function Home() {
                       Hit rate = triggers ÷ (segments × expected reps). Can exceed 100% if the detector double-fires per gesture.
                       First-trigger latency = time from segment start to first detection (lower = quicker pickup, but depends on how soon you started the gesture after the segment opened).
                       Inter-trigger interval = average gap between consecutive triggers within a clench segment (close to your intended ~3 s rest between reps = good).
-                      Tilt is scored differently (it's continuous steering, not a discrete trigger): a segment is "engaged" if peak steer crossed the ±0.1 dead zone, and "directions distinct" confirms left and right tilts produced opposite-signed steering.
+                      Tilt is scored differently (it&apos;s continuous steering, not a discrete trigger): a segment is &quot;engaged&quot; if peak steer crossed the ±0.1 dead zone, and &quot;directions distinct&quot; confirms left and right tilts produced opposite-signed steering.
                     </p>
                   </div>
                 )
@@ -1306,8 +1528,21 @@ export default function Home() {
             forwardActive (debounce passed), the card background flashes yellow. */}
         {(() => {
           const haveBaseline = baseline !== null
-          const liveTpPct = haveBaseline ? Math.min(150, (liveSignal.tpEma / Math.max(tpThrFwd, 1)) * 100) : 0
-          const liveAfPct = haveBaseline ? Math.min(150, (liveSignal.afEma / Math.max(afThrRev, 1)) * 100) : 0
+          // Gate each card by its gesture's eligibility (ratio in the right zone AND the
+          // other gesture not active) so doing ONE gesture doesn't light up the OTHER's
+          // meter. On this user an eyebrow raise also drives TP high, so without gating
+          // the Forward bar would misleadingly peg at 150% during a reverse.
+          const fwdEligible = liveSignal.ratio < CLENCH_MAX_AFTP_RATIO && !reverseActive
+          const revEligible = liveSignal.ratio > EYEBROW_MIN_AFTP_RATIO && !forwardActive
+          // Show progress from the resting baseline (0 %) up to the trigger (100 %), not
+          // from zero signal — otherwise the bar hovers at the resting noise floor (~50 %)
+          // instead of sitting at 0 when the face is relaxed.
+          const baseTp = baseline ? baseline.tpHigh : 0
+          const baseAf = baseline ? baseline.afHigh : 0
+          const liveTpPct = haveBaseline && (forwardActive || fwdEligible)
+            ? Math.min(150, Math.max(0, (liveSignal.tpEma - baseTp) / Math.max(tpThrFwd - baseTp, 1) * 100)) : 0
+          const liveAfPct = haveBaseline && (reverseActive || revEligible)
+            ? Math.min(150, Math.max(0, (liveSignal.afEma - baseAf) / Math.max(afThrRev - baseAf, 1) * 100)) : 0
           return (
             <>
               <div className={`p-6 rounded-xl transition-colors duration-100 ${forwardActive ? 'bg-yellow-500' : 'bg-gray-800'}`}>
@@ -1354,11 +1589,27 @@ export default function Home() {
         <div className={`p-6 rounded-xl bg-gray-800 ${carConnected ? 'ring-1 ring-emerald-600' : ''}`}>
           <h2 className="text-lg font-semibold">Head Tilt</h2>
           <div className="font-mono mt-3 mb-2 space-y-1 text-sm">
-            <p>X: {(accel.x - accelOffset).toFixed(3)}</p>
-            <p>Y: {accel.y.toFixed(3)}</p>
-            <p>Z: {accel.z.toFixed(3)}</p>
+            <p>steer cmd: <span className={steerOut !== 0 ? 'text-emerald-400' : ''}>{steerOut.toFixed(2)}</span> <span className="text-gray-500">(in {steerIn.toFixed(3)})</span></p>
+            <p className="text-gray-500 text-xs">raw  x {accel.x.toFixed(3)}  ·  y {accel.y.toFixed(3)}  ·  z {accel.z.toFixed(3)}</p>
           </div>
           <p className="text-xs text-gray-500 mb-3">dead zone ±{DEAD_ZONE}</p>
+          <label className="text-sm text-gray-300 mb-1 block">
+            Steering sensitivity — {steerGain.toFixed(1)}×
+          </label>
+          <input
+            type="range"
+            min={STEER_GAIN_MIN} max={STEER_GAIN_MAX} step={0.5}
+            value={steerGain}
+            onChange={e => {
+              const v = Number(e.target.value)
+              setSteerGain(v)
+              localStorage.setItem('steerGain.v1', String(v))
+            }}
+            className="w-full accent-blue-500 mb-3"
+          />
+          <div className="flex justify-between text-xs text-gray-600 -mt-2 mb-3">
+            <span>{STEER_GAIN_MIN}× (gentle)</span><span>{STEER_GAIN_MAX}× (twitchy)</span>
+          </div>
           <button
             onClick={calibrateTilt}
             disabled={museStatus !== 'connected' && !simulating}
@@ -1381,12 +1632,12 @@ export default function Home() {
             </label>
             <input
               type="range"
-              min={SENSITIVITY_MIN} max={SENSITIVITY_MAX} step={0.5}
+              min={SENSITIVITY_MIN} max={SENSITIVITY_MAX} step={0.1}
               value={forwardSensitivity}
               onChange={e => {
                 const v = Number(e.target.value)
                 setForwardSensitivity(v)
-                localStorage.setItem('forwardSensitivity.v5', String(v))
+                localStorage.setItem('forwardSensitivity.v7', String(v))
               }}
               className="w-full accent-yellow-500"
             />
