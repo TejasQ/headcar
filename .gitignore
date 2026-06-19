@@ -1,0 +1,15 @@
+# Test recordings (raw session .json data) — large, kept locally as thesis
+# evidence. Remove this line if you want them version-controlled instead.
+/TestFiles/
+
+# Personal / admin docs — keep out of the public repo
+INVOICE.*
+TIME_REPORT.*
+
+# Separate project that happens to live in this folder
+/vector-stuff/
+
+# Editor / tool scratch + backup files
+.bob/
+.claude/
+*.bak
