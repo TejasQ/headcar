@@ -137,6 +137,18 @@ This project documents the design and build of a brain-controlled RC car using a
 
 ## Journal
 
+### 2026-06-19 — Sustained live drive captured + battery runtime measured (HEA-16, HEA-17 closed)
+
+The two remaining Sprint-2 build-path issues closed, completing the end-to-end car build.
+
+**HEA-16 — first sustained live closed-loop drive, recorded.** A continuous 127.9 s Muse-driven drive was captured to `laptop/recordings/headcar-2026-06-19_08-41-45.json` (10,793 EEG packets, 2,213 accel samples). Forward triggered 4×, reverse 3×, and steering was exercised throughout; drive commands spanned the full range (−0.7 reverse to +1.0 forward). No watchdog or disconnect events occurred over the run — the system held together well beyond the demo's length. Session calibration: baseline AF 4.6 µV / TP 11.8 µV, forward sensitivity 1.6×, reverse 1.5×. This is the direct sustained-run evidence for **RQ1** (live closed-loop control) that every prior validation had only approached via bench replays, and it confirms demo-length stability. An earlier 82 s run is retained alongside it.
+
+**Two findings surfaced by the live run.** (a) *Effort cost (RQ4).* Holding a continuous clench for the full two minutes fatigued the jaw; switching to a burst-and-rest style — short clench bursts for forward, with reverse/steer/coast between — was both realistic and sustainable. The sustained-clench fatigue is a concrete instance of the accuracy-vs-effort tradeoff. (b) *Per-session calibration (RQ5).* A stale `forwardSensitivity = 2.5×` persisted in the browser from a prior session and caused forward to stutter/segment — the threshold sat too high for a comfortable clench to hold, so forward dropped out and re-fired. Recalibrating and lowering the sensitivity to ~1.2–1.6× restored smooth control, reinforcing that the sensitivity must be re-confirmed per fit/session.
+
+**HEA-17 — battery runtime.** Using a new dashboard endurance control (steady `drive:0.6`, resent ahead of the watchdog, with an on-screen timer), the car drove continuously for **11 min 29 s** and was stopped manually with charge remaining — a lower bound, not a true drain-to-cutoff, and cutoff voltage was not measured (no multimeter on hand). This comfortably answers the demo-pacing question: the full presentation is ~12 min with only ~3 min of actual driving, and real demo driving is intermittent rather than the continuous load measured here, so a **single 18650 pack is sufficient — no second pack or mid-demo swap needed.**
+
+With HEA-16 and HEA-17 closed, the entire **Build path is complete**: the car drives reliably under Muse control, the watchdog and arm/disarm safety are verified, steering and thresholds are tuned, wiring is documented, and runtime is characterised.
+
 ### 2026-06-17 — Watchdog verified, steering finalized, gesture separation validated (HEA-18, HEA-19, HEA-21 closed)
 
 Two Sprint-2 build-path issues closed at the bench today.
