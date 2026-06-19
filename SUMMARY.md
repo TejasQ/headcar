@@ -48,43 +48,77 @@ The app is deployed to Vercel but must be run locally (npm run dev) when driving
 Chassis ships with 4x AA holder — ignore it, use 2x 18650 holder instead. Two parallel paths from same battery pack, isolated by the buck so motor noise does not crash the ESP32:
 
 ```
-2x 18650 (7.4V) --+---> TB6612 VM ---> motors
+2x 18650 (7.4V) --+---> L298N +12V ---> motors (L298N H-bridge)
+                  |                 \--> L298N onboard 5V reg ---> L298N logic
                   |
-                  +---> MP1584 buck (set to 5V) ---> ESP32 VIN
+                  +---> (untethered only) MP1584 buck 5V ---> ESP32 VIN
+                                          (bench: ESP32 powered over USB instead)
 
-All grounds tied together. ESP32 3.3V ---> TB6612 VCC (logic power).
+All grounds tied on the negative rail: battery -, L298N GND, ESP32 GND.
 ```
+
+**Driver swap (2026-06-15):** the original TB6612FNG was abandoned after four modules proved counterfeit (dead high-side — see thesis 2026-06-15). Now using an **L298N**, which self-powers its logic from +12V via its onboard 5V regulator (5V-enable jumper ON) — so unlike the TB6612 there is **no** ESP32-3.3V-to-driver-VCC wire. The MP1584 buck is now only for untethered ESP32 power (or the L298N's +5V output can feed ESP32 VIN). Buck cable colours, if used: white on IN (from battery), black on OUT (to ESP32 VIN).
 
 Headband power: Muse 2 internal LiPo, charges via USB.
 
-## ESP32 to motor driver wiring
+## ESP32 to motor driver wiring (L298N)
 
-| ESP32 GPIO | TB6612 | Purpose             |
-|------------|--------|---------------------|
-| 4          | PWMA   | Left speed (PWM)    |
-| 5          | AIN1   | Left direction A    |
-| 18         | AIN2   | Left direction B    |
-| 19         | PWMB   | Right speed (PWM)   |
-| 15         | BIN1   | Right direction A   |
-| 16         | BIN2   | Right direction B   |
-| 17         | STBY   | Enable (HIGH = on)  |
-| 3.3V       | VCC    | TB6612 logic power  |
-| GND        | GND    | ALL grounds tied    |
+Same ESP32 GPIOs as the old TB6612 build, re-pointed to L298N pins. The firmware pin
+*names* are unchanged (`car/car.ino` header documents the name→L298N mapping):
 
-GPIO 6 and 7 are flash pins on the ESP32 — unusable. AIN2 and PWMB use 18 and 19 instead.
+| ESP32 GPIO | L298N | code name  | Purpose                       |
+|------------|-------|------------|-------------------------------|
+| 4          | ENA   | PWMA       | Left speed (PWM)              |
+| 5          | IN1   | AIN1       | Left direction 1              |
+| 18         | IN2   | AIN2       | Left direction 2              |
+| 19         | ENB   | PWMB       | Right speed (PWM)             |
+| 15         | IN3   | BIN1       | Right direction 1             |
+| 16         | IN4   | BIN2       | Right direction 2             |
+| (none)     | —     | STBY (17)  | UNUSED on L298N (leave open)  |
+| GND        | GND   | —          | common ground (negative rail) |
 
-Direction truth table:
-- A=on, B=off  -> forward
-- A=off, B=on  -> reverse
-- A=off, B=off -> coast
-- A=on, B=on   -> brake
+Power terminals (screw): battery + (7.4 V) → **+12V**; negative rail → **GND**; **+5V** left
+empty (it's an output). GPIO 6/7 are flash pins on the ESP32 — unusable.
+
+L298N jumper caps: **5V-enable ON** (self-powers logic from +12V); **ENA and ENB caps OFF**
+(so the GPIO 4 / GPIO 19 PWM wires control speed — caps on = speed locked to full).
+
+As-built wire colours: see the `l298n-wiring-colour-code` memory (ENA red, IN1 yellow, IN2
+orange, IN3 blue, IN4 brown, ENB purple, +12V red, GND grey).
+
+### Motor outputs (4 motors → 2 channels)
+
+Two channels (A, B), each a pair of screw terminals. Pair each side **in parallel** — channel
+**A = left**, **B = right** (matches firmware `leftSpeed → ENA`, `rightSpeed → ENB`):
+
+| L298N output | Motors                              | Side              |
+|--------------|-------------------------------------|-------------------|
+| OUT1 / OUT2  | left-front + left-rear (parallel)   | LEFT (channel A)  |
+| OUT3 / OUT4  | right-front + right-rear (parallel) | RIGHT (channel B) |
+
+Parallel via the breadboard: OUT1 → its own row, both left motors' wire-1 into that row; same
+for OUT2/OUT3/OUT4. Each output gets its OWN row — never two outputs in one row, never on the
++/− rails (that shorts the H-bridge). Motor current runs through the breadboard clips, the weak
+spot under load — harden (twist into the screw terminal / solder) if the car browns out or a
+junction warms.
+
+Polarity: if one wheel spins opposite its partner, swap that motor's two wires; if a whole side
+runs backward, swap both wires on that channel. Get all four spinning forward together before
+tuning steering.
+
+Direction truth table (per channel, e.g. A):
+- IN1=H, IN2=L -> forward
+- IN1=L, IN2=H -> reverse
+- IN1=L, IN2=L -> coast (off)
+- IN1=H, IN2=H -> brake
+(ENA/ENB PWM duty sets speed; 0 = stopped.)
 
 ## Build phases
 
 1. Phase 1 — Browser hello world. DONE. Next.js dashboard with Muse BLE connect, blink/jaw clench/accel display, simulate mode, and WebSocket client to car. Live tested with real Muse 2 — blink, jaw clench, and accelerometer all confirmed working.
-2. Phase 2 — Forward only. Software fully working: ESP32 receives WebSocket commands, Serial Monitor confirms correct messages. Soldering done at xHain. Post-solder debug session (2026-05-22): (1) grounds not tied — ESP32 reset on motor activation, fixed by tying all grounds to negative rail; (2) VCC missing — TB6612 logic power (3.3V from ESP32 3V3 pin) was not wired to TB6612 VCC, causing outputs to be dead; (3) after fixing VCC, AO1/AO2 still read 0V on both the original and a spare TB6612 board despite all signals verified correct (VM=7.63V, VCC=3.3V, STBY=3.3V, PWMA=3.3V, AIN1=3.3V, AIN2=0V, BIN1=3.3V, BIN2=0V, breadboard halves correct, solder joints solid) — both boards confirmed counterfeit/defective batch. Motors confirmed working via direct battery test. Left motor wires paired to AO1/AO2, right motor wires paired to BO1/BO2 (parallel per side). Ordered Adafruit ADA2448 TB6612FNG breakout (genuine) — pending arrival and retest.
+2. Phase 2 — Forward only. Software fully working: ESP32 receives WebSocket commands, Serial Monitor confirms correct messages. Soldering done at xHain. Post-solder debug session (2026-05-22): (1) grounds not tied — ESP32 reset on motor activation, fixed by tying all grounds to negative rail; (2) VCC missing — TB6612 logic power (3.3V from ESP32 3V3 pin) was not wired to TB6612 VCC, causing outputs to be dead; (3) after fixing VCC, AO1/AO2 still read 0V on both the original and a spare TB6612 board despite all signals verified correct (VM=7.63V, VCC=3.3V, STBY=3.3V, PWMA=3.3V, AIN1=3.3V, AIN2=0V, BIN1=3.3V, BIN2=0V, breadboard halves correct, solder joints solid) — both boards confirmed counterfeit/defective batch. Motors confirmed working via direct battery test. Left motor wires paired to AO1/AO2, right motor wires paired to BO1/BO2 (parallel per side). Ordered Adafruit ADA2448 TB6612FNG breakout (genuine) — pending arrival and retest. **Resolution (2026-06-15):** the genuine-board path was overtaken — in total **four** TB6612 modules (original, a hand-replaced unit, and both boards of a fresh sealed 2-pack) all failed *identically*: low-side worked, but the **high-side never engaged** in either direction (forward output stuck at 0 V despite IN1=H, IN2=L, PWM=H, STBY=H, VM=7.34 V, all grounds tied, no shorts). Every input/power/ground measured correct at the chip pins, and a motor spun fine straight off the battery — isolating the fault to the driver silicon. This dead-high-side signature across four boards is the known failure mode of **counterfeit TB6612 chips** (non-functional internal high-side charge pump). Switched to an **L298N** (BJT H-bridge, no charge pump — immune to this fault); it drove on the first try. Full write-up: thesis 2026-06-15.
 3. Phase 3 — Add reverse. DONE (sketch side). ESP32 now parses message payload: blink = forward 200ms, clench = reverse 200ms, stop = coast. Dashboard updated with manual Forward/Reverse/Stop buttons and configurable car URL input (no longer hardcoded).
-4. Phase 4 — Add steering. DONE (software). ESP32 sketch refactored to non-blocking state machine (millis() instead of delay()). Accepts steer:X messages (-1.0 to +1.0) and applies differential PWM: left/right motor speeds shift based on roll value. Dashboard streams steer:X every 100ms when car is connected. Pending: physical motor test after TB6612 replacement.
+4. Phase 4 — Add steering. DONE (software). ESP32 sketch refactored to non-blocking state machine (millis() instead of delay()). Accepts steer:X messages (-1.0 to +1.0) and applies differential PWM: left/right motor speeds shift based on roll value. Dashboard streams steer:X every 100ms when car is connected. **Update (2026-06-15):** after four counterfeit TB6612 modules failed (see Phase 2), the driver was swapped to an **L298N** and a single motor now drives under firmware control. Pending: parallel-wire all 4 motors (left→OUT1/2, right→OUT3/4), remove the temp self-test, restore normal dashboard control, then full closed-loop drive test.
 
 ## Dashboard signal quality work (2026-05-25)
 
@@ -134,8 +168,8 @@ Tools:
 
 - 18650 battery holder — velcro or zip tie
 - Buck converter — double-sided tape or zip tie
-- ESP32 + TB6612 on breadboard — breadboard adhesive backing sticks to plate
-- Motor wires run up from bottom plate through chassis slots to TB6612
+- ESP32 + L298N on breadboard — breadboard adhesive backing sticks to plate
+- Motor wires run up from bottom plate through chassis slots to L298N
 - All power and signal wires tied down with zip ties
 
 Buy before xHain: velcro tape or double-sided foam tape + zip ties — Rossmann is closest in Friedrichshain.

@@ -26,17 +26,25 @@ const char* ssid     = "Jon iPhone 16";
 const char* password = "jon42027";
 // ──────────────────────────────────────────────────────────────
 
-// Motor driver pins (TB6612FNG). #define just gives a name to a GPIO number so
-// the code reads "AIN1" instead of "5". These numbers are FIXED by how the board
-// is physically wired (see README) — changing them here would not rewire anything.
-// Each motor (A and B) has: one PWM pin (speed) + two direction pins (IN1/IN2).
-#define PWMA  4    // Motor A speed   (PWM 0–255)
-#define AIN1  5    // Motor A direction bit 1
-#define AIN2  18   // Motor A direction bit 2
-#define PWMB  19   // Motor B speed   (PWM 0–255)
-#define BIN1  15   // Motor B direction bit 1
-#define BIN2  16   // Motor B direction bit 2
-#define STBY  17   // Standby — must be HIGH for the driver to do anything; LOW = motors off
+// Motor driver pins. Now wired to an L298N (swapped from the TB6612). The control
+// scheme is the SAME — each motor has one PWM "enable" pin (speed) + two direction
+// pins — so the code below is unchanged; only the board-side labels differ:
+//   code name  ESP32 GPIO   ->  L298N pin
+//   PWMA        4           ->  ENA   (Motor A speed/enable)
+//   AIN1        5           ->  IN1   (Motor A direction 1)
+//   AIN2        18          ->  IN2   (Motor A direction 2)
+//   PWMB        19          ->  ENB   (Motor B speed/enable)
+//   BIN1        15          ->  IN3   (Motor B direction 1)
+//   BIN2        16          ->  IN4   (Motor B direction 2)
+//   STBY        17          ->  (UNUSED — L298N has no standby pin; leave disconnected)
+// Remove the ENA/ENB jumpers on the L298N so these PWM pins control speed.
+#define PWMA  4    // -> ENA  Motor A speed (PWM 0–255)
+#define AIN1  5    // -> IN1  Motor A direction 1
+#define AIN2  18   // -> IN2  Motor A direction 2
+#define PWMB  19   // -> ENB  Motor B speed (PWM 0–255)
+#define BIN1  15   // -> IN3  Motor B direction 1
+#define BIN2  16   // -> IN4  Motor B direction 2
+#define STBY  17   // UNUSED on L298N (harmless no-op writes); leave the pin disconnected
 
 // ── Car state ──────────────────────────────────────────────────
 // These globals hold "what the car is currently being told to do". onWsEvent()
@@ -61,9 +69,16 @@ const unsigned long WATCHDOG_MS = 500;
 const int MIN_PWM = 120;
 const int MAX_PWM = 255;
 const float DRIVE_DEADZONE = 0.05;      // ignore tiny drive values (noise) — treat as "stop"
-// Differential steering: to turn, drive one wheel faster than the other. This is
-// how much of the base speed to add to one side and subtract from the other.
-const float STEER_DIFFERENTIAL = 0.35;
+// Differential steering: how sharply the car turns at full steer. 1.0 = inside wheel
+// stops (sharp pivot); >1.0 = inside wheel counter-rotates → drift/spin. Fixed here;
+// the dashboard's single "Steering sensitivity" slider controls how much head tilt is
+// needed to reach full steer (so one knob governs the whole tilt→turn feel).
+const float STEER_DIFFERENTIAL = 1.0;
+// Per-side speed trim (HEA-18) for mismatched motors. If the car veers when it
+// should go straight, nudge this: POSITIVE = left side faster (use when the car
+// pulls RIGHT); NEGATIVE = right side faster (pulls LEFT). Sensible range about
+// [-0.15, 0.15]. 0.0 = matched motors, no trim (current default — inert).
+const float MOTOR_TRIM = 0.0;
 
 WebSocketsServer ws(81);  // the WebSocket server object, listening on port 81
 
@@ -76,8 +91,24 @@ void motorsOff() {
   ledcWrite(PWMB, 0);
 }
 
+// Drive ONE motor side from a signed command in [-1, 1]: the sign picks direction
+// (forward/reverse) and the magnitude picks speed. Per-side direction control is what
+// lets the inside wheel counter-rotate for a sharp pivot/drift turn.
+void setSide(int in1, int in2, int pwmPin, float cmd) {
+  float m = fabs(cmd);
+  if (m < 0.03) {                                  // ~zero → coast this side (both pins LOW)
+    digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+    ledcWrite(pwmPin, 0);
+    return;
+  }
+  if (cmd > 0) { digitalWrite(in1, HIGH); digitalWrite(in2, LOW); }   // forward
+  else         { digitalWrite(in1, LOW);  digitalWrite(in2, HIGH); }  // reverse
+  // Map magnitude 0..1 onto MIN_PWM..MAX_PWM (skip the dead 0..120 stiction band).
+  ledcWrite(pwmPin, constrain(MIN_PWM + (int)(m * (MAX_PWM - MIN_PWM)), 0, 255));
+}
+
 // Called every loop — applies current driveValue + steerValue to motors.
-// This is where the abstract number driveValue becomes real pin voltages.
+// This is where the abstract numbers become real pin voltages.
 void applyMotors() {
   // SAFETY GATE first: stop if the last command is older than WATCHDOG_MS
   // (laptop went away) OR the command is within the deadzone (basically "stop").
@@ -87,30 +118,15 @@ void applyMotors() {
     return;  // early-return: nothing below runs, motors stay off
   }
 
-  bool forward = driveValue > 0;        // sign of driveValue picks direction
-  float mag = fabs(driveValue);         // magnitude (0..1) picks speed
-
-  // Map speed 0..1 onto the usable PWM range MIN_PWM..MAX_PWM (skips the dead
-  // 0..120 band where motors won't turn). (int) truncates the float to a whole number.
-  int basePWM  = MIN_PWM + (int)(mag * (MAX_PWM - MIN_PWM));
-  // Steering: shift speed between the two sides. +offset to one, -offset to other.
-  int offset   = (int)(steerValue * basePWM * STEER_DIFFERENTIAL);
-  // constrain(x, 0, 255) clamps so we never send an out-of-range PWM value.
-  int leftSpeed  = constrain(basePWM + offset, 0, 255);
-  int rightSpeed = constrain(basePWM - offset, 0, 255);
-
   digitalWrite(STBY, HIGH);  // enable the driver chip
-  // Direction truth table (per TB6612): IN1 HIGH / IN2 LOW = one way; swap = other.
-  if (forward) {
-    digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
-    digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
-  } else {
-    digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
-    digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
-  }
-  // Finally set the speeds. Direction pins say which way; these say how fast.
-  ledcWrite(PWMA, leftSpeed);
-  ledcWrite(PWMB, rightSpeed);
+  // Signed per-side mixing: each side = base drive ± steering (+ trim). steerDifferential
+  // scales the turn; when the steer term pushes a side past 0 it flips sign → that wheel
+  // reverses (counter-rotation) for a sharp pivot/drift. constrain keeps it in [-1, 1].
+  float steerAmt = steerValue * STEER_DIFFERENTIAL;
+  float leftCmd  = constrain(driveValue + steerAmt + MOTOR_TRIM, -1.0, 1.0);
+  float rightCmd = constrain(driveValue - steerAmt - MOTOR_TRIM, -1.0, 1.0);
+  setSide(AIN1, AIN2, PWMA, leftCmd);
+  setSide(BIN1, BIN2, PWMB, rightCmd);
 }
 
 // Called automatically by the WebSocket library every time a message arrives.
