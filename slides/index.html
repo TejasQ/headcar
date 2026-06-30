@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Headcar — meetup slides</title>
+<style>
+  :root {
+    --bg: #0b0b0f;
+    --fg: #f4f4f5;
+    --muted: #8b8b96;
+    --accent: #ffb000;     /* arc-reactor amber */
+    --accent2: #4ea3ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  .slide {
+    position: fixed; inset: 0;
+    display: none;
+    flex-direction: column; justify-content: center; align-items: center;
+    text-align: center;
+    padding: 6vh 8vw;
+    gap: 2.2rem;
+  }
+  .slide.active { display: flex; animation: fade .35s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+  h1 { font-size: clamp(2.4rem, 7vw, 6rem); line-height: 1.04; letter-spacing: -0.02em; font-weight: 800; }
+  h2 { font-size: clamp(1.8rem, 5vw, 4rem); line-height: 1.08; letter-spacing: -0.01em; font-weight: 800; }
+  .kicker { color: var(--accent); font-size: clamp(.9rem,1.6vw,1.1rem); text-transform: uppercase; letter-spacing: .28em; font-weight: 700; }
+  .sub { color: var(--muted); font-size: clamp(1.1rem, 2.4vw, 1.9rem); max-width: 24ch; line-height: 1.35; }
+  .flow { font-size: clamp(1.3rem, 3.2vw, 2.5rem); font-weight: 600; }
+  .flow b { color: var(--accent2); }
+  .stack { font-size: clamp(1.2rem, 2.6vw, 2rem); color: var(--fg); line-height: 1.8; opacity:.92;}
+  .accent { color: var(--accent); }
+  .links { color: var(--muted); font-size: clamp(1rem,2vw,1.4rem); line-height:1.8; }
+  .links b { color: var(--fg); }
+  .browser { display:flex; flex-direction:column; align-items:center; gap:.8rem; margin-top:.2rem; }
+  .browser .bar { width: min(800px, 64vw); display:flex; align-items:center; gap:.45rem; background:#17171d; border:1px solid #2a2a32; border-bottom:none; border-radius:10px 10px 0 0; padding:.5rem .7rem; }
+  .browser .bar i { width:9px; height:9px; border-radius:50%; background:#3a3a44; display:inline-block; }
+  .browser .bar em { margin-left:.7rem; color:#6a6a76; font-style:normal; font-size:.78rem; }
+  .browser .vp { width: min(800px, 64vw); height: min(40vh, 360px); overflow:hidden; border:1px solid #2a2a32; border-radius:0 0 10px 10px; box-shadow:0 30px 80px rgba(0,0,0,.6); background:#0a0a0e; }
+  .browser .vp img { width:100%; display:block; will-change: transform; }
+  .browser figcaption { color: var(--muted); font-size: clamp(.9rem,1.7vw,1.2rem); }
+  .browser figcaption b { color: var(--fg); }
+  @keyframes sitescroll { 0%, 14% { transform: translateY(0); } 100% { transform: translateY(-54.6%); } }
+  .slide.active .browser .vp img { animation: sitescroll 5.5s ease-in-out forwards; }
+  .slide.endslide { padding-bottom: 11vh; }   /* lift content clear of the nav dots */
+  .giant { font-size: clamp(5rem, 22vw, 18rem); font-weight: 900; letter-spacing: -.03em; color: var(--accent); }
+  .imgnote { color:#55555f; font-size:.8rem; border:1px dashed #33333b; padding:.4rem .8rem; border-radius:8px; }
+
+  /* progress + hint */
+  .dots { position: fixed; bottom: 2vh; left: 0; right: 0; display: flex; gap: .5rem; justify-content: center; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #2a2a32; }
+  .dot.on { background: var(--accent); }
+  .count { position: fixed; top: 3vh; right: 4vw; color: #44444c; font-size: .9rem; }
+  .hint { position: fixed; bottom: 2vh; right: 4vw; color: #33333b; font-size: .8rem; }
+
+  /* QR to the site (close slide only, beside the live preview) */
+  .closerow { display:flex; align-items:center; justify-content:center; gap: clamp(1rem, 3vw, 2.4rem); flex-wrap:wrap; }
+  .qr-card { background:#fff; padding:9px; border-radius:11px; box-shadow:0 10px 34px rgba(0,0,0,.45);
+             display:flex; flex-direction:column; align-items:center; gap:5px; text-decoration:none; flex:none; }
+  .qr-card img { width: clamp(86px, 10vw, 132px); height:auto; display:block; }
+  .qr-card span { font-size:.64rem; letter-spacing:.14em; text-transform:uppercase; color:#555; font-weight:700; }
+
+  /* real fire video on the LIVE slide; black drops out via screen blend */
+  .live .giant, .live .sub { position: relative; z-index: 2; }
+  .live .giant { text-shadow: 0 2px 4px rgba(0,0,0,.75), 0 0 28px rgba(0,0,0,.6), 0 0 64px rgba(255,90,0,.5); }
+  .live .sub { color:#fff1cf; text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 12px rgba(0,0,0,.7); }
+  .firevid { position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+             z-index:1; pointer-events:none; mix-blend-mode: screen; }
+
+  /* a slide can carry a full-bleed image: set style="background-image:url('car.jpg')" on .slide.bg */
+  .slide.bg { background-size: cover; background-position: center; }
+  .slide.bg::before { content:""; position:absolute; inset:0; background: rgba(11,11,15,.55); }
+  .slide.bg > * { position: relative; z-index: 1; }
+</style>
+</head>
+<body>
+
+  <!-- 1 · TITLE -->
+  <section class="slide active">
+    <p class="kicker">AI Meetup · Berlin</p>
+    <h1>Build your way<br>out of any hole.</h1>
+    <p class="sub">Headcar · a car you drive with your face</p>
+  </section>
+
+  <!-- 2 · MEET HEADCAR -->
+  <section class="slide">
+    <p class="kicker">the project</p>
+    <h2>Drive a car with your face.</h2>
+    <p class="stack">clench → forward &nbsp;·&nbsp; eyebrows → reverse &nbsp;·&nbsp; tilt → steer</p>
+    <p class="sub">not your thoughts, your face</p>
+  </section>
+
+  <!-- 3 · IRON MAN  (optional: add an image -> <section class="slide bg" style="background-image:url('ironman.jpg')">) -->
+  <section class="slide">
+    <p class="kicker">where it started</p>
+    <h1>"Build your way<br>out of anything."</h1>
+    <p class="sub">the one superpower I actually wanted</p>
+  </section>
+
+  <!-- 4 · BUILDER'S ERA -->
+  <section class="slide">
+    <p class="kicker">the shift</p>
+    <h2>We live in a builder's era.</h2>
+    <p class="flow">idea &nbsp;<b>→</b>&nbsp; AI &nbsp;<b>→</b>&nbsp; working thing</p>
+    <p class="sub">I vibe-coded this in two months, still learning to code</p>
+  </section>
+
+  <!-- 5 · HOW IT WORKS -->
+  <section class="slide">
+    <p class="kicker">under the hood</p>
+    <p class="flow">Muse &nbsp;<b>→</b>&nbsp; Browser &nbsp;<b>→</b>&nbsp; ESP32 &nbsp;<b>→</b>&nbsp; Motors</p>
+    <p class="sub">no ML, just a 5-second calibration. it reads where the signal lands.</p>
+  </section>
+
+  <!-- 6 · THE BUILD -->
+  <section class="slide">
+    <p class="kicker">the build</p>
+    <h2>A comedy of problems.</h2>
+    <p class="stack">4 counterfeit chips · textbooks flat wrong · signal lost in noise</p>
+    <p class="imgnote">[optional: drop car.jpg in /slides and add it as the slide background]</p>
+  </section>
+
+  <!-- 7 · LIVE  (set a car photo as background for max effect) -->
+  <section class="slide live">
+    <video class="firevid" src="fire.mp4" autoplay loop muted playsinline></video>
+    <p class="giant">LIVE</p>
+    <p class="sub">(demo)</p>
+  </section>
+
+  <!-- 8 · CLOSE -->
+  <section class="slide endslide">
+    <h1>The tools got free.<br><span class="accent">Taste didn't.</span></h1>
+    <p class="sub">build the thing you care about this week.</p>
+    <div class="closerow">
+      <figure class="browser">
+        <div class="bar"><i></i><i></i><i></i><em>jonathanestephan.com</em></div>
+        <div class="vp"><img src="site_full.png" alt="jonathanestephan.com" /></div>
+        <figcaption><b>jonathanestephan.com</b> &nbsp;·&nbsp; github.com/TejasQ/headcar</figcaption>
+      </figure>
+      <a class="qr-card" href="https://jonathanestephan.com" target="_blank" rel="noopener" onclick="event.stopPropagation()">
+        <img src="qr.svg" alt="jonathanestephan.com" />
+        <span>scan me</span>
+      </a>
+    </div>
+  </section>
+
+  <div class="count"><span id="cur">1</span> / <span id="total">8</span></div>
+  <div class="dots" id="dots"></div>
+  <div class="hint">← → or space</div>
+
+<script>
+  const slides = [...document.querySelectorAll('.slide')];
+  const dots = document.getElementById('dots');
+  let i = 0;
+  document.getElementById('total').textContent = slides.length;
+  slides.forEach((_, n) => {
+    const d = document.createElement('div'); d.className = 'dot' + (n === 0 ? ' on' : ''); dots.appendChild(d);
+  });
+  const dotEls = [...dots.children];
+  function show(n) {
+    i = Math.max(0, Math.min(slides.length - 1, n));
+    slides.forEach((s, k) => s.classList.toggle('active', k === i));
+    dotEls.forEach((d, k) => d.classList.toggle('on', k === i));
+    document.getElementById('cur').textContent = i + 1;
+  }
+  function next() { show(i + 1); }
+  function prev() { show(i - 1); }
+  document.addEventListener('keydown', e => {
+    if (['ArrowRight', ' ', 'PageDown', 'ArrowDown'].includes(e.key)) { e.preventDefault(); next(); }
+    else if (['ArrowLeft', 'PageUp', 'ArrowUp'].includes(e.key)) { e.preventDefault(); prev(); }
+    else if (e.key === 'Home') show(0);
+    else if (e.key === 'End') show(slides.length - 1);
+  });
+  document.addEventListener('click', e => { (e.clientX > window.innerWidth / 2) ? next() : prev(); });
+</script>
+</body>
+</html>
